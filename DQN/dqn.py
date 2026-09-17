@@ -76,7 +76,8 @@ class ReplayBuffer:
         
 class DQN:
     def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
-                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, max_size_buffer=40000):
+                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, max_size_buffer=40000,
+                double_dqn_flag=False):
         self.env = env
         self.state_dim = self.env.observation_space.shape[0]
         self.action_dim = self.env.action_space.n
@@ -111,7 +112,10 @@ class DQN:
         self.obs_high = torch.tensor(self.env.observation_space.high, dtype=torch.float32, device=self.device)
 
         self.history = {'return': [], 'loss': [], 'success_rate': [], 'epsilon': []}
-        
+
+        self.double_dqn_flag = double_dqn_flag
+
+
     def preprocess(self, obs):
         norm_obs = 2 * (obs - self.obs_low) / (self.obs_high - self.obs_low) - 1
         return norm_obs
@@ -147,8 +151,15 @@ class DQN:
 
     @torch.no_grad()
     def compute_target(self, next_state, reward, terminated):
-        next_q_value = self.t_net(self.preprocess(next_state)).max(dim=-1).values
+        if not self.double_dqn_flag:
+            next_q_vector = self.t_net(self.preprocess(next_state))
+            next_q_value = next_q_vector.max(dim=-1).values
+        else:
+            next_q_vector = self.q_net(self.preprocess(next_state))
+            action = next_q_vector.argmax(dim=-1).unsqueeze(1)
+            next_q_value = self.t_net(self.preprocess(next_state)).gather(dim=1, index=action).squeeze(1)
         target = torch.where(terminated, reward, reward + self.gamma * next_q_value)
+                        
         return target
 
     def update_q_net(self, state, action, reward, next_state, terminated):
