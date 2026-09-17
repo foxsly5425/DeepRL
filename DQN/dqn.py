@@ -1,3 +1,33 @@
+import sys, os
+
+import torch
+import torch.nn as nn
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import random
+import time
+
+from collections import deque
+
+
+import gymnasium as gym
+
+env = gym.make("MountainCar-v0", render_mode="rgb_array")
+env.reset()
+
+plt.imshow(env.render())
+print("Observation space:", env.observation_space)
+print("Action space:", env.action_space)
+
+if torch.xpu.is_available():
+    device = torch.device('xpu')
+else:
+    device = torch.device('cpu')
+
+print("Device:", device)
+
 class Q_net(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
