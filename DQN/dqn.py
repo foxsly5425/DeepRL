@@ -1,0 +1,201 @@
+class Q_net(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
+        )
+
+        last = self.net[-1]
+        nn.init.normal_(last.weight, mean=0.0, std=1e-3)
+        nn.init.constant_(last.bias, -1.0)
+
+    def forward(self, x):
+        return self.net(x)
+        
+class ReplayBuffer:
+    def __init__(self, max_size):
+        self.max_size = max_size
+        self.buffer = deque(maxlen=self.max_size)
+
+    def append(self, data):
+        state, action, reward, next_state, terminated = data
+        self.buffer.append((np.asarray(state, dtype=np.float32),
+                           action, 
+                           reward,
+                           np.asarray(next_state, dtype=np.float32),
+                           terminated))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+
+        state, action, reward, next_state, terminated = zip(*batch)
+
+        return (torch.as_tensor(np.stack(state), dtype=torch.float32), 
+                torch.as_tensor(action, dtype=torch.long),
+                torch.as_tensor(reward, dtype=torch.float32),
+                torch.as_tensor(np.stack(next_state), dtype=torch.float32),
+                torch.as_tensor(terminated, dtype=torch.bool))
+
+    def __len__(self):
+        return len(self.buffer)
+        
+class DQN:
+    def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
+                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, max_size_buffer=40000):
+        self.env = env
+        self.state_dim = self.env.observation_space.shape[0]
+        self.action_dim = self.env.action_space.n
+        
+        self.device = device
+        
+        self.q_net = Q_net(self.state_dim, self.action_dim).to(self.device)
+        
+        self.t_net = Q_net(self.state_dim, self.action_dim).to(self.device)
+        self.t_net.load_state_dict(self.q_net.state_dict())
+        self.t_net.requires_grad_(False)
+        self.t_net.eval()
+        
+        self.gamma = gamma
+        self.loss_fn = nn.SmoothL1Loss()
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+
+        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer)
+        self.exploration_repeat = exploration_repeat
+        self.buffer_size_for_start_train = buffer_size_for_start_train
+        
+        self.episodes = episodes
+        self.batch_size = batch_size
+        self.update_steps = 0
+        self.target_update_interval = target_update_interval
+        
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+
+        self.obs_low  = torch.tensor(self.env.observation_space.low, dtype=torch.float32, device=self.device)
+        self.obs_high = torch.tensor(self.env.observation_space.high, dtype=torch.float32, device=self.device)
+
+        self.history = {'return': [], 'loss': [], 'success_rate': [], 'epsilon': []}
+        
+    def preprocess(self, obs):
+        norm_obs = 2 * (obs - self.obs_low) / (self.obs_high - self.obs_low) - 1
+        return norm_obs
+
+    def select_action(self, state):
+        if torch.rand(1) < self.epsilon:
+            return self.env.action_space.sample(), True
+
+        with torch.no_grad():
+            state = state.to(self.device)
+            action = self.q_net(self.preprocess(state)).argmax().item()
+
+        return action, False
+        
+    def collect_data(self, state):        
+        action, random_action_flag = self.select_action(state)
+    
+        cycle_length =  self.exploration_repeat if random_action_flag else 1
+        for i in range(cycle_length):
+            next_observation, reward, terminated, truncated, _ = self.env.step(action)
+            next_state = torch.tensor(next_observation)
+        
+            self.replay_buffer.append([state, action, reward, next_state, terminated])
+            state = next_state
+
+            if terminated or truncated:
+                break
+            
+        return next_state, terminated, truncated, random_action_flag
+
+    def update_t_net(self):
+        self.t_net.load_state_dict(self.q_net.state_dict())
+
+    @torch.no_grad()
+    def compute_target(self, next_state, reward, terminated):
+        next_q_value = self.t_net(self.preprocess(next_state)).max(dim=-1).values
+        target = torch.where(terminated, reward, reward + self.gamma * next_q_value)
+        return target
+
+    def update_q_net(self, state, action, reward, next_state, terminated):
+        state = state.to(self.device)
+        action = action.to(self.device)
+        reward = reward.to(self.device)
+        next_state = next_state.to(self.device)
+        terminated = terminated.to(self.device)
+        
+        q_value = self.q_net(self.preprocess(state))
+        q_value = q_value.gather(dim=1, index=action.unsqueeze(1)).squeeze(1)
+        target = self.compute_target(next_state, reward, terminated)
+        loss = self.loss_fn(q_value, target)
+    
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+
+    def fit(self):
+        max_position_lst = []
+        min_position_lst = []
+        metric_time = 0
+        success_rate = 0
+        
+        for episode in range(1, self.episodes+1):
+            start_time = time.time()
+            
+            observation, info = self.env.reset()
+            state = torch.tensor(observation)
+            terminated = truncated = False  
+            max_position = min_position = observation[0]
+            
+            while not (terminated or truncated):
+                next_state, terminated, truncated, random_action_flag = self.collect_data(state)
+                state = next_state
+                max_position = max(max_position, state[0].item())
+                min_position = min(min_position, state[0].item())
+        
+        
+                if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
+                    batch_state, batch_action, batch_reward, batch_next_state, batch_terminated = self.replay_buffer.sample(self.batch_size)
+                    loss = self.update_q_net(batch_state, batch_action, batch_reward, batch_next_state, batch_terminated)
+
+                    self.history['loss'].append(loss)
+                    
+                    self.update_steps += 1
+
+                    if self.update_steps % self.target_update_interval == 0:
+                        self.update_t_net()
+ 
+                if terminated:
+                    success_rate += 1
+        
+            max_position_lst.append(max_position)
+            min_position_lst.append(min_position)
+                
+
+            if episode % 100 == 0 and success_rate > 10:
+                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        
+            end_time = time.time()
+            metric_time += end_time - start_time
+            
+            if episode % 100  == 0:
+                self.metrics(episode, max_position_lst, min_position_lst, metric_time, success_rate)
+                max_position_lst = []
+                min_position_lst = []
+                self.history['success_rate'].append(success_rate)
+                self.history['epsilon'].append(self.epsilon)
+                success_rate = 0
+
+    def metrics(self, episode, max_position_lst, min_position_lst, metric_time, success_rate):
+        best_min_max = max([max_position_lst[i] - min_position_lst[i] for i in range(len(max_position_lst))])
+        print(f'episod: {episode}, success rate: {success_rate}%')
+        print(f'max_position_mean: {sum(max_position_lst) / len(max_position_lst)}, min_position_mean: {sum(min_position_lst) / len(min_position_lst)}') 
+        print(f'best_min_max: {best_min_max}')
+        print(f'epsilon: {self.epsilon}, time: {metric_time // 60} min')
+        print('-'*50)
