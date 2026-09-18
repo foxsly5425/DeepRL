@@ -29,24 +29,42 @@ else:
 print("Device:", device)
 
 class Q_net(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, dueling_dqn_flag):
         super().__init__()
+        self.dueling_dqn_flag = dueling_dqn_flag
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
         )
 
-        last = self.net[-1]
-        nn.init.normal_(last.weight, mean=0.0, std=1e-3)
-        nn.init.constant_(last.bias, -1.0)
+        if self.dueling_dqn_flag:
+            self.v_head = nn.Linear(64, 1)
+            self.adv_head = nn.Linear(64, action_dim)
+
+            nn.init.normal_(self.v_head.weight, mean=0.0, std=1e-3)
+            nn.init.constant_(self.v_head.bias, -1.0)
+            nn.init.normal_(self.adv_head.weight, mean=0.0, std=1e-3)
+            nn.init.constant_(self.adv_head.bias, -1.0)
+        else:
+            self.head = nn.Linear(64, action_dim)
+            
+            nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
+            nn.init.constant_(self.head.bias, -1.0)
 
     def forward(self, x):
-        return self.net(x)
-        
+        x = self.net(x)
+        if not self.dueling_dqn_flag:
+            v = self.v_head(x)
+            adv = self.adv_head(x)
+            mean_adv = adv.mean(dim=-1, keepdim=True)
+            outp = v + adv - mean_adv
+        else:
+            outp = self.head(x)
+        return outp
+
 class ReplayBuffer:
     def __init__(self, max_size):
         self.max_size = max_size
@@ -77,7 +95,11 @@ class ReplayBuffer:
 class DQN:
     def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
                 exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, max_size_buffer=40000,
-                double_dqn_flag=False):
+                double_dqn_flag=False, dueling_dqn_flag=False):
+        
+        self.double_dqn_flag = double_dqn_flag
+        self.dueling_dqn_flag = dueling_dqn_flag
+        
         self.env = env
         self.state_dim = self.env.observation_space.shape[0]
         self.action_dim = self.env.action_space.n
@@ -112,9 +134,6 @@ class DQN:
         self.obs_high = torch.tensor(self.env.observation_space.high, dtype=torch.float32, device=self.device)
 
         self.history = {'return': [], 'loss': [], 'success_rate': [], 'epsilon': []}
-
-        self.double_dqn_flag = double_dqn_flag
-
 
     def preprocess(self, obs):
         norm_obs = 2 * (obs - self.obs_low) / (self.obs_high - self.obs_low) - 1
