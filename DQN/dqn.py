@@ -106,9 +106,9 @@ class DQN:
         
         self.device = device
         
-        self.q_net = Q_net(self.state_dim, self.action_dim).to(self.device)
+        self.q_net = Q_net(self.state_dim, self.action_dim, self.dueling_dqn_flag).to(self.device)
         
-        self.t_net = Q_net(self.state_dim, self.action_dim).to(self.device)
+        self.t_net = Q_net(self.state_dim, self.action_dim, self.dueling_dqn_flag).to(self.device)
         self.t_net.load_state_dict(self.q_net.state_dict())
         self.t_net.requires_grad_(False)
         self.t_net.eval()
