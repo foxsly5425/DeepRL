@@ -56,7 +56,7 @@ class Q_net(nn.Module):
 
     def forward(self, x):
         x = self.net(x)
-        if not self.dueling_dqn_flag:
+        if self.dueling_dqn_flag:
             v = self.v_head(x)
             adv = self.adv_head(x)
             mean_adv = adv.mean(dim=-1, keepdim=True)
@@ -66,35 +66,61 @@ class Q_net(nn.Module):
         return outp
 
 class ReplayBuffer:
-    def __init__(self, max_size):
+    def __init__(self, max_size, alpha, epsilon, max_priority=1.0):
         self.max_size = max_size
         self.buffer = deque(maxlen=self.max_size)
-
+        self.max_priority = max_priority
+        self.alpha = alpha
+        self.epsilon = epsilon
+        
     def append(self, data):
         state, action, reward, next_state, terminated = data
-        self.buffer.append((np.asarray(state, dtype=np.float32),
+        self.buffer.append([
+                           np.asarray(state, dtype=np.float32),
                            action, 
                            reward,
                            np.asarray(next_state, dtype=np.float32),
-                           terminated))
+                           terminated, 
+                           self.max_priority, 
+        ])
 
+    def new_max_priority(self, batch_indx):
+        new_max_priority = max([self.buffer[indx][-1] for indx in batch_indx])
+        self.max_priority = max(self.max_priority, new_max_priority)
+        
+    def change_priority(self, batch_indx, batch_prior):
+        for idx, prior in zip(batch_indx, batch_prior):
+            self.buffer[idx][-1] = prior + self.epsilon
+        self.new_max_priority(batch_indx)
+    
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
+        priorities = np.asarray([transition[-1] ** self.alpha for transition in self.buffer], dtype=np.float64)
+        sum_priority = priorities.sum()
+        
+        probabilities = priorities / sum_priority
 
-        state, action, reward, next_state, terminated = zip(*batch)
+        indx = np.random.choice(len(self.buffer), size=batch_size, p=probabilities)
+        batch = [self.buffer[i] for i in indx]
+        batch_prob = [probabilities[i] for i in indx]
+        
+        state, action, reward, next_state, terminated, priority = zip(*batch)
 
-        return (torch.as_tensor(np.stack(state), dtype=torch.float32), 
+        return (torch.as_tensor(indx, dtype=torch.long),
+                torch.as_tensor(np.stack(state), dtype=torch.float32), 
                 torch.as_tensor(action, dtype=torch.long),
                 torch.as_tensor(reward, dtype=torch.float32),
                 torch.as_tensor(np.stack(next_state), dtype=torch.float32),
-                torch.as_tensor(terminated, dtype=torch.bool))
+                torch.as_tensor(terminated, dtype=torch.bool),
+                torch.as_tensor(batch_prob, dtype=torch.float32),
+               )
 
     def __len__(self):
         return len(self.buffer)
         
 class DQN:
     def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
-                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, max_size_buffer=40000,
+                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, 
+                max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
                 double_dqn_flag=False, dueling_dqn_flag=False):
         
         self.double_dqn_flag = double_dqn_flag
@@ -114,10 +140,12 @@ class DQN:
         self.t_net.eval()
         
         self.gamma = gamma
-        self.loss_fn = nn.SmoothL1Loss()
+        self.loss_fn = nn.SmoothL1Loss(reduction='none')
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
 
-        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer)
+        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, alpha=alpha_buffer, epsilon=epsilon_buffer)
+        self.beta_per_weight = beta_per_weight
+        self.beta_per_weight_decay = beta_per_weight_decay
         self.exploration_repeat = exploration_repeat
         self.buffer_size_for_start_train = buffer_size_for_start_train
         
@@ -181,7 +209,7 @@ class DQN:
                         
         return target
 
-    def update_q_net(self, state, action, reward, next_state, terminated):
+    def update_q_net(self, state, action, reward, next_state, terminated, probailities):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
@@ -191,11 +219,19 @@ class DQN:
         q_value = self.q_net(self.preprocess(state))
         q_value = q_value.gather(dim=1, index=action.unsqueeze(1)).squeeze(1)
         target = self.compute_target(next_state, reward, terminated)
-        loss = self.loss_fn(q_value, target)
-    
+        raw_loss = self.loss_fn(q_value, target)
+        
+        buffer_prior = torch.abs(target - q_value).detach().cpu().numpy()
+        weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
+        weight = weight / weight.max()
+
+        loss = (weight * raw_loss).mean()
+        
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        
+        self.replay_buffer.change_priority(indx, buffer_prior)
 
         return loss.item()
 
@@ -221,9 +257,9 @@ class DQN:
         
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
-                    batch_state, batch_action, batch_reward, batch_next_state, batch_terminated = self.replay_buffer.sample(self.batch_size)
-                    loss = self.update_q_net(batch_state, batch_action, batch_reward, batch_next_state, batch_terminated)
-
+                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_probabilities = self.replay_buffer.sample(self.batch_size)
+                    loss = self.update_q_net(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_probabilities)
+                    
                     self.history['loss'].append(loss)
                     
                     self.update_steps += 1
@@ -240,7 +276,11 @@ class DQN:
 
             if episode % 100 == 0 and success_rate > 10:
                 self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        
+
+            if episode % 100 == 0:
+                self.beta_per_weight = min(1, self.beta_per_weight * self.beta_per_weight_decay)
+
+                
             end_time = time.time()
             metric_time += end_time - start_time
             
