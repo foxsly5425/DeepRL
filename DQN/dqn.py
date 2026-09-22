@@ -66,56 +66,59 @@ class Q_net(nn.Module):
         return outp
 
 class ReplayBuffer:
-    def __init__(self, max_size, alpha, epsilon, max_priority=1.0):
+    def __init__(self, max_size, state_dim, alpha, epsilon, max_priority=1.0):
         self.max_size = max_size
-        self.buffer = deque(maxlen=self.max_size)
+        self.last_pos = 0
+        self.size = 0
+
+        self.states = np.empty((self.max_size, state_dim), dtype=np.float32)
+        self.actions = np.empty(self.max_size, dtype=np.int64)
+        self.rewards = np.empty(self.max_size, dtype=np.float32)
+        self.next_states = np.empty((self.max_size, state_dim), dtype=np.float32)
+        self.terminated = np.empty(self.max_size, dtype=np.bool_)
+        self.priorities = np.empty(self.max_size, dtype=np.float64)
+
         self.max_priority = max_priority
         self.alpha = alpha
         self.epsilon = epsilon
         
     def append(self, data):
         state, action, reward, next_state, terminated = data
-        self.buffer.append([
-                           np.asarray(state, dtype=np.float32),
-                           action, 
-                           reward,
-                           np.asarray(next_state, dtype=np.float32),
-                           terminated, 
-                           self.max_priority, 
-        ])
 
-    def new_max_priority(self, batch_indx):
-        new_max_priority = max([self.buffer[indx][-1] for indx in batch_indx])
-        self.max_priority = max(self.max_priority, new_max_priority)
+        self.states[self.last_pos] = np.asarray(state, dtype=np.float32)
+        self.actions[self.last_pos] = action
+        self.rewards[self.last_pos] = reward
+        self.next_states[self.last_pos] = next_state
+        self.terminated[self.last_pos] = terminated
+        self.priorities[self.last_pos] = self.max_priority
+        
+        self.last_pos = (self.last_pos + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
         
     def change_priority(self, batch_indx, batch_prior):
-        for idx, prior in zip(batch_indx, batch_prior):
-            self.buffer[idx][-1] = prior + self.epsilon
-        self.new_max_priority(batch_indx)
+        priorities = np.asarray(batch_prior, dtype=np.float64) + self.epsilon
+        self.priorities[batch_indx] = priorities
+        self.max_priority = max(self.max_priority, float(priorities.max()))
     
     def sample(self, batch_size):
-        priorities = np.asarray([transition[-1] ** self.alpha for transition in self.buffer], dtype=np.float64)
-        sum_priority = priorities.sum()
+        scaled_priorities = self.priorities[:self.size] ** self.alpha
+        sum_priority = scaled_priorities.sum()
         
-        probabilities = priorities / sum_priority
+        probabilities = scaled_priorities / sum_priority
 
-        indx = np.random.choice(len(self.buffer), size=batch_size, p=probabilities)
-        batch = [self.buffer[i] for i in indx]
-        batch_prob = [probabilities[i] for i in indx]
-        
-        state, action, reward, next_state, terminated, priority = zip(*batch)
-
-        return (torch.as_tensor(indx, dtype=torch.long),
-                torch.as_tensor(np.stack(state), dtype=torch.float32), 
-                torch.as_tensor(action, dtype=torch.long),
-                torch.as_tensor(reward, dtype=torch.float32),
-                torch.as_tensor(np.stack(next_state), dtype=torch.float32),
-                torch.as_tensor(terminated, dtype=torch.bool),
-                torch.as_tensor(batch_prob, dtype=torch.float32),
-               )
+        indx = np.random.choice(self.size, size=batch_size, p=probabilities)
+        return (
+            indx,
+            torch.from_numpy(self.states[indx]),
+            torch.from_numpy(self.actions[indx]),
+            torch.from_numpy(self.rewards[indx]),
+            torch.from_numpy(self.next_states[indx]),
+            torch.from_numpy(self.terminated[indx]),
+            torch.as_tensor(probabilities[indx]),
+        )
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
         
 class DQN:
     def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
@@ -179,19 +182,25 @@ class DQN:
         
     def collect_data(self, state):        
         action, random_action_flag = self.select_action(state)
-    
+
+        final_reward = -100
+        total_reward = 0
+
         cycle_length =  self.exploration_repeat if random_action_flag else 1
         for i in range(cycle_length):
             next_observation, reward, terminated, truncated, _ = self.env.step(action)
             next_state = torch.tensor(next_observation)
-        
+
+            total_reward += reward
+            
             self.replay_buffer.append([state, action, reward, next_state, terminated])
             state = next_state
 
-            if terminated or truncated:
+            if terminated:
+                final_reward = reward
+                
+            if  terminated or truncated:
                 break
-            
-        return next_state, terminated, truncated, random_action_flag
 
     def update_t_net(self):
         self.t_net.load_state_dict(self.q_net.state_dict())
@@ -209,7 +218,7 @@ class DQN:
                         
         return target
 
-    def update_q_net(self, state, action, reward, next_state, terminated, probailities):
+    def update_q_net(self, indx, state, action, reward, next_state, terminated, probailities):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
@@ -250,11 +259,12 @@ class DQN:
             max_position = min_position = observation[0]
             
             while not (terminated or truncated):
-                next_state, terminated, truncated, random_action_flag = self.collect_data(state)
+                next_state, terminated, truncated, final_reward, total_reward, random_action_flag = self.collect_data(state)
                 state = next_state
                 max_position = max(max_position, state[0].item())
                 min_position = min(min_position, state[0].item())
-        
+                episod_return += total_reward
+
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
                     batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_probabilities = self.replay_buffer.sample(self.batch_size)
@@ -267,7 +277,9 @@ class DQN:
                     if self.update_steps % self.target_update_interval == 0:
                         self.update_t_net()
  
-                if terminated:
+            self.history['return'].append(episod_return)
+
+            if terminated and final_reward == 100:
                     success_rate += 1
         
             max_position_lst.append(max_position)
