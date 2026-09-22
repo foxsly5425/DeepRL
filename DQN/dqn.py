@@ -77,13 +77,14 @@ class ReplayBuffer:
         self.next_states = np.empty((self.max_size, state_dim), dtype=np.float32)
         self.terminated = np.empty(self.max_size, dtype=np.bool_)
         self.priorities = np.empty(self.max_size, dtype=np.float64)
+        self.gamma_pow = np.empty(self.max_size, dtype=np.int32)
 
         self.max_priority = max_priority
         self.alpha = alpha
         self.epsilon = epsilon
         
     def append(self, data):
-        state, action, reward, next_state, terminated = data
+        state, action, reward, next_state, terminated, gamma_pow = data
 
         self.states[self.last_pos] = np.asarray(state, dtype=np.float32)
         self.actions[self.last_pos] = action
@@ -91,7 +92,8 @@ class ReplayBuffer:
         self.next_states[self.last_pos] = next_state
         self.terminated[self.last_pos] = terminated
         self.priorities[self.last_pos] = self.max_priority
-        
+        self.gamma_pow[self.last_pos] = gamma_pow
+
         self.last_pos = (self.last_pos + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         
@@ -114,7 +116,8 @@ class ReplayBuffer:
             torch.from_numpy(self.rewards[indx]),
             torch.from_numpy(self.next_states[indx]),
             torch.from_numpy(self.terminated[indx]),
-            torch.as_tensor(probabilities[indx]),
+            torch.from_numpy(self.gamma_pow[indx]),
+            torch.as_tensor(probabilities[indx], dtype=torch.float32),
         )
 
     def __len__(self):
@@ -124,11 +127,12 @@ class DQN:
     def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
                 exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, 
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
-                double_dqn_flag=False, dueling_dqn_flag=False):
+                double_dqn_flag=False, dueling_dqn_flag=False, n_step_return=1):
         
         self.double_dqn_flag = double_dqn_flag
         self.dueling_dqn_flag = dueling_dqn_flag
-        
+        self.n_step_return = n_step_return 
+
         self.env = env
         self.state_dim = self.env.observation_space.shape[0]
         self.action_dim = self.env.action_space.n
@@ -146,7 +150,7 @@ class DQN:
         self.loss_fn = nn.SmoothL1Loss(reduction='none')
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
 
-        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, alpha=alpha_buffer, epsilon=epsilon_buffer)
+        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, state_dim=self.state_dim, alpha=alpha_buffer, epsilon=epsilon_buffer)
         self.beta_per_weight = beta_per_weight
         self.beta_per_weight_decay = beta_per_weight_decay
         self.exploration_repeat = exploration_repeat
@@ -187,26 +191,36 @@ class DQN:
         total_reward = 0
 
         cycle_length =  self.exploration_repeat if random_action_flag else 1
-        for i in range(cycle_length):
+
+        n_return = gamma_pow = 0
+        first_action = action
+        for step in range(self.n_step_return):
             next_observation, reward, terminated, truncated, _ = self.env.step(action)
             next_state = torch.tensor(next_observation)
-
-            total_reward += reward
             
-            self.replay_buffer.append([state, action, reward, next_state, terminated])
-            state = next_state
+            total_reward += reward
+            n_return += (self.gamma ** gamma_pow) * reward
+            gamma_pow += 1
 
-            if terminated:
-                final_reward = reward
-                
-            if  terminated or truncated:
+            if truncated or terminated or step == self.n_step_return - 1:
                 break
+
+            action, _ = self.select_action(next_state)
+            
+        self.replay_buffer.append([state, first_action, n_return, next_state, terminated, gamma_pow])
+        state = next_state
+
+        if terminated:
+            final_reward = reward
+
+        return next_state, terminated, truncated, final_reward, total_reward, random_action_flag
+
 
     def update_t_net(self):
         self.t_net.load_state_dict(self.q_net.state_dict())
 
     @torch.no_grad()
-    def compute_target(self, next_state, reward, terminated):
+    def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
         if not self.double_dqn_flag:
             next_q_vector = self.t_net(self.preprocess(next_state))
             next_q_value = next_q_vector.max(dim=-1).values
@@ -214,20 +228,21 @@ class DQN:
             next_q_vector = self.q_net(self.preprocess(next_state))
             action = next_q_vector.argmax(dim=-1).unsqueeze(1)
             next_q_value = self.t_net(self.preprocess(next_state)).gather(dim=1, index=action).squeeze(1)
-        target = torch.where(terminated, reward, reward + self.gamma * next_q_value)
+        target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * next_q_value)
                         
         return target
 
-    def update_q_net(self, indx, state, action, reward, next_state, terminated, probailities):
+    def update_q_net(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
         next_state = next_state.to(self.device)
         terminated = terminated.to(self.device)
-        
+        gamma_pow = gamma_pow.to(self.device)
+
         q_value = self.q_net(self.preprocess(state))
         q_value = q_value.gather(dim=1, index=action.unsqueeze(1)).squeeze(1)
-        target = self.compute_target(next_state, reward, terminated)
+        target = self.compute_target(next_state, reward, terminated, gamma_pow)
         raw_loss = self.loss_fn(q_value, target)
         
         buffer_prior = torch.abs(target - q_value).detach().cpu().numpy()
@@ -257,7 +272,8 @@ class DQN:
             state = torch.tensor(observation)
             terminated = truncated = False  
             max_position = min_position = observation[0]
-            
+
+            episod_return = 0
             while not (terminated or truncated):
                 next_state, terminated, truncated, final_reward, total_reward, random_action_flag = self.collect_data(state)
                 state = next_state
@@ -267,8 +283,8 @@ class DQN:
 
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
-                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_probabilities = self.replay_buffer.sample(self.batch_size)
-                    loss = self.update_q_net(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_probabilities)
+                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities = self.replay_buffer.sample(self.batch_size)
+                    loss = self.update_q_net(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
                     
                     self.history['loss'].append(loss)
                     
