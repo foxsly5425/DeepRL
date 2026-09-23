@@ -131,7 +131,9 @@ class DQN:
         
         self.double_dqn_flag = double_dqn_flag
         self.dueling_dqn_flag = dueling_dqn_flag
+
         self.n_step_return = n_step_return 
+        self.n_step_buffer = deque()
 
         self.env = env
         self.state_dim = self.env.observation_space.shape[0]
@@ -183,33 +185,41 @@ class DQN:
             action = self.q_net(self.preprocess(state)).argmax().item()
 
         return action, False
-        
+
+    def n_step_sliding_window(self):
+        n_return = gamma_pow = 0
+        first_state, first_action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
+        for i in range(self.n_step_return):
+            _, _, reward, next_state, terminated, truncated = self.n_step_buffer[i]
+            n_return += (self.gamma ** gamma_pow) * reward
+            gamma_pow += 1
+
+            if truncated or terminated:
+                break
+
+        self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow])
+        self.n_step_buffer.popleft()
+
     def collect_data(self, state):        
         action, random_action_flag = self.select_action(state)
 
         final_reward = -100
         total_reward = 0
 
-        cycle_length =  self.exploration_repeat if random_action_flag else 1
+        next_observation, reward, terminated, truncated, _ = self.env.step(action)
+        next_state = torch.tensor(next_observation)
 
-        n_return = gamma_pow = 0
-        first_action = action
-        for step in range(self.n_step_return):
-            next_observation, reward, terminated, truncated, _ = self.env.step(action)
-            next_state = torch.tensor(next_observation)
+        self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated])
+
+        if terminated or truncated:
+            while self.n_step_buffer:
+                self.n_step_sliding_window()
+        elif len(self.n_step_buffer) == self.n_step_return:
+            self.n_step_sliding_window()
             
-            total_reward += reward
-            n_return += (self.gamma ** gamma_pow) * reward
-            gamma_pow += 1
-
-            if truncated or terminated or step == self.n_step_return - 1:
-                break
-
-            action, _ = self.select_action(next_state)
-            
-        self.replay_buffer.append([state, first_action, n_return, next_state, terminated, gamma_pow])
         state = next_state
 
+        total_reward += reward
         if terminated:
             final_reward = reward
 
@@ -277,8 +287,6 @@ class DQN:
             while not (terminated or truncated):
                 next_state, terminated, truncated, final_reward, total_reward, random_action_flag = self.collect_data(state)
                 state = next_state
-                max_position = max(max_position, state[0].item())
-                min_position = min(min_position, state[0].item())
                 episod_return += total_reward
 
         
@@ -296,11 +304,7 @@ class DQN:
             self.history['return'].append(episod_return)
 
             if terminated and final_reward == 100:
-                    success_rate += 1
-        
-            max_position_lst.append(max_position)
-            min_position_lst.append(min_position)
-                
+                    success_rate += 1                
 
             if episode % 100 == 0 and success_rate > 10:
                 self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
@@ -314,16 +318,12 @@ class DQN:
             
             if episode % 100  == 0:
                 self.metrics(episode, max_position_lst, min_position_lst, metric_time, success_rate)
-                max_position_lst = []
-                min_position_lst = []
                 self.history['success_rate'].append(success_rate)
                 self.history['epsilon'].append(self.epsilon)
                 success_rate = 0
 
     def metrics(self, episode, max_position_lst, min_position_lst, metric_time, success_rate):
-        best_min_max = max([max_position_lst[i] - min_position_lst[i] for i in range(len(max_position_lst))])
         print(f'episod: {episode}, success rate: {success_rate}%')
-        print(f'max_position_mean: {sum(max_position_lst) / len(max_position_lst)}, min_position_mean: {sum(min_position_lst) / len(min_position_lst)}') 
-        print(f'best_min_max: {best_min_max}')
+        print(f'mean return: {sum(self.history['return'][-100:]) / 100}')
         print(f'epsilon: {self.epsilon}, time: {metric_time // 60} min')
         print('-'*50)
