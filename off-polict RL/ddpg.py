@@ -29,8 +29,10 @@ class actor(nn.Module):
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, action_dim),
         )
@@ -44,8 +46,10 @@ class critic(nn.Module):
             
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
@@ -158,15 +162,31 @@ class DDPG:
         self.batch_size = batch_size
         self.update_steps = 0
 
-        self.obs_low  = torch.tensor(self.env.observation_space.low, dtype=torch.float32, device=self.device)
-        self.obs_high = torch.tensor(self.env.observation_space.high, dtype=torch.float32, device=self.device)
+        self.obs_count = 0
+        self.obs_mean = np.zeros(self.state_dim, dtype=np.float64)
+        self.obs_m2 = np.zeros(self.state_dim, dtype=np.float64)
 
         self.history = {'return': [], 'critic_loss': [], 'actor_loss': [], 'success_rate': [],
                         'episode_success': [], 'episode_length': []}
 
+    def update_obs_metrics(self, observation):
+        x = np.asarray(observation, dtype=np.float64)
+        self.obs_count += 1
+
+        delta = x - self.obs_mean
+        self.obs_mean += delta / self.obs_count
+
+        delta_after_update = x - self.obs_mean
+        self.obs_m2 += delta * delta_after_update
+        
     def preprocess(self, obs):
-        norm_obs = 2 * (obs - self.obs_low) / (self.obs_high - self.obs_low) - 1
-        return norm_obs
+        if self.obs_count < 2:
+            return obs
+            
+        mean = torch.as_tensor(self.obs_mean, dtype=obs.dtype, device=obs.device)
+        variance = torch.as_tensor(self.obs_m2 / self.obs_count, dtype=obs.dtype, device=obs.device)
+    
+        return (obs - mean) / torch.sqrt(variance + 1e-8)
 
     @torch.no_grad()
     def select_action(self, state, noise_std=0.1):
@@ -197,6 +217,8 @@ class DDPG:
         total_reward = 0
 
         next_observation, reward, terminated, truncated, _ = self.env.step(action)
+        self.update_obs_metrics(next_observation)
+
         next_state = torch.tensor(next_observation, dtype=torch.float32)
 
         self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated])
@@ -224,8 +246,9 @@ class DDPG:
 
     @torch.no_grad()
     def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
-        next_action = self.T_Actor(next_state)
-        next_q_value = self.T_Critic(next_state, next_action)
+        normalize_next_state = self.preprocess(next_state)
+        next_action = self.T_Actor(normalize_next_state)
+        next_q_value = self.T_Critic(normalize_next_state, next_action)
         target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * next_q_value)
         return target
 
@@ -237,7 +260,8 @@ class DDPG:
         terminated = terminated.to(self.device)
         gamma_pow = gamma_pow.to(self.device)
 
-        q_value = self.Q_Critic(state, action)
+        normalize_state = self.preprocess(state)
+        q_value = self.Q_Critic(normalize_state, action)
         target = self.compute_target(next_state, reward, terminated, gamma_pow)
         critic_raw_loss = self.loss_fn(q_value, target)
         
@@ -259,7 +283,8 @@ class DDPG:
         state = state.to(self.device)
         self.Q_Critic.requires_grad_(False)
 
-        policy_action = self.Q_Actor(state)
+        normalize_state = self.preprocess(state)
+        policy_action = self.Q_Actor(normalize_state)
         policy_q_value = self.Q_Critic(state, policy_action)
         actor_loss = -policy_q_value.mean()
 
@@ -279,6 +304,7 @@ class DDPG:
             start_time = time.time()
             
             observation, info = self.env.reset()
+            self.update_obs_metrics(observation)
             state = torch.tensor(observation, dtype=torch.float32)
             terminated = truncated = False  
             max_position = min_position = observation[0]
