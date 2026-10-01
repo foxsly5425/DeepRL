@@ -2,6 +2,7 @@ import sys, os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,7 +15,7 @@ from collections import deque
 
 import gymnasium as gym
 
-env = gym.make("MountainCar-v0", render_mode="rgb_array")
+env = gym.make("InvertedPendulum-v5", render_mode='rgb_array')
 env.reset()
 
 if torch.xpu.is_available():
@@ -22,51 +23,45 @@ if torch.xpu.is_available():
 else:
     device = torch.device('cpu')
 
-class Q_net(nn.Module):
-    def __init__(self, state_dim, action_dim, dueling_dqn_flag):
+class actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.dueling_dqn_flag = dueling_dqn_flag
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
+            nn.Linear(64, action_dim),
         )
 
-        if self.dueling_dqn_flag:
-            self.v_head = nn.Linear(64, 1)
-            self.adv_head = nn.Linear(64, action_dim)
-
-            nn.init.normal_(self.v_head.weight, mean=0.0, std=1e-3)
-            nn.init.constant_(self.v_head.bias, -1.0)
-            nn.init.normal_(self.adv_head.weight, mean=0.0, std=1e-3)
-            nn.init.constant_(self.adv_head.bias, -1.0)
-        else:
-            self.head = nn.Linear(64, action_dim)
-            
-            nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
-            nn.init.constant_(self.head.bias, -1.0)
-
     def forward(self, x):
-        x = self.net(x)
-        if self.dueling_dqn_flag:
-            v = self.v_head(x)
-            adv = self.adv_head(x)
-            mean_adv = adv.mean(dim=-1, keepdim=True)
-            outp = v + adv - mean_adv
-        else:
-            outp = self.head(x)
-        return outp
+        return  3 * F.tanh(self.net(x))
+
+class critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+            
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, state, action):
+        x = torch.cat([state, action], dim=-1)
+        return  self.net(x).squeeze(-1)
 
 class ReplayBuffer:
-    def __init__(self, max_size, state_dim, alpha, epsilon, max_priority=1.0):
+    def __init__(self, max_size, state_dim, action_dim, alpha, epsilon, max_priority=1.0):
         self.max_size = max_size
         self.last_pos = 0
         self.size = 0
 
         self.states = np.empty((self.max_size, state_dim), dtype=np.float32)
-        self.actions = np.empty(self.max_size, dtype=np.int64)
+        self.actions = np.empty((self.max_size, action_dim), dtype=np.float32)
         self.rewards = np.empty(self.max_size, dtype=np.float32)
         self.next_states = np.empty((self.max_size, state_dim), dtype=np.float32)
         self.terminated = np.empty(self.max_size, dtype=np.bool_)
@@ -117,68 +112,69 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
         
-class DQN:
-    def __init__(self, env, episodes=10000, batch_size=64, epsilon=0.1, epsilon_min=0.01, epsilon_decay=0.95, device='cpu', 
-                exploration_repeat=20, gamma=0.99, lr=1e-3, target_update_interval=1000, buffer_size_for_start_train=2000, 
+class DDPG:
+    def __init__(self, env, episodes=10000, batch_size=64, device='cpu',
+                gamma=0.99, lr=1e-3, buffer_size_for_start_train=2000,
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
-                double_dqn_flag=False, dueling_dqn_flag=False, n_step_return=1):
-        
-        self.double_dqn_flag = double_dqn_flag
-        self.dueling_dqn_flag = dueling_dqn_flag
+                n_step_return=1, tau_update_t_nets=0.005):
 
         self.n_step_return = n_step_return 
         self.n_step_buffer = deque()
 
         self.env = env
         self.state_dim = self.env.observation_space.shape[0]
-        self.action_dim = self.env.action_space.n
+        self.action_dim = self.env.action_space.shape[0]
         
         self.device = device
         
-        self.q_net = Q_net(self.state_dim, self.action_dim, self.dueling_dqn_flag).to(self.device)
+        self.Q_Actor = actor(self.state_dim, self.action_dim).to(self.device)
+        self.Q_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         
-        self.t_net = Q_net(self.state_dim, self.action_dim, self.dueling_dqn_flag).to(self.device)
-        self.t_net.load_state_dict(self.q_net.state_dict())
-        self.t_net.requires_grad_(False)
-        self.t_net.eval()
+        self.T_Actor = actor(self.state_dim, self.action_dim).to(self.device)
+        self.T_Critic = critic(self.state_dim, self.action_dim).to(self.device)
+
+        self.T_Actor.load_state_dict(self.Q_Actor.state_dict())
+        self.T_Critic.load_state_dict(self.Q_Critic.state_dict())
+
+        self.T_Actor.requires_grad_(False)
+        self.T_Critic.requires_grad_(False)
+        self.T_Actor.eval()
+        self.T_Critic.eval()
+
+        self.tau_update_t_nets = tau_update_t_nets
         
         self.gamma = gamma
-        self.loss_fn = nn.SmoothL1Loss(reduction='none')
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss(reduction='none')
+        self.actor_optimizer = torch.optim.Adam(self.Q_Actor.parameters(), lr=lr)
+        self.critic_optimizer = torch.optim.Adam(self.Q_Critic.parameters(), lr=lr)
 
-        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, state_dim=self.state_dim, alpha=alpha_buffer, epsilon=epsilon_buffer)
+        self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, state_dim=self.state_dim, action_dim=self.action_dim,
+                                          alpha=alpha_buffer, epsilon=epsilon_buffer)
         self.beta_per_weight = beta_per_weight
         self.beta_per_weight_decay = beta_per_weight_decay
-        self.exploration_repeat = exploration_repeat
         self.buffer_size_for_start_train = buffer_size_for_start_train
         
         self.episodes = episodes
         self.batch_size = batch_size
         self.update_steps = 0
-        self.target_update_interval = target_update_interval
-        
-        self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
 
         self.obs_low  = torch.tensor(self.env.observation_space.low, dtype=torch.float32, device=self.device)
         self.obs_high = torch.tensor(self.env.observation_space.high, dtype=torch.float32, device=self.device)
 
-        self.history = {'return': [], 'loss': [], 'success_rate': [], 'epsilon': []}
+        self.history = {'return': [], 'critic_loss': [], 'actor_loss': [], 'success_rate': [],
+                        'episode_success': [], 'episode_length': []}
 
     def preprocess(self, obs):
         norm_obs = 2 * (obs - self.obs_low) / (self.obs_high - self.obs_low) - 1
         return norm_obs
 
-    def select_action(self, state):
-        if torch.rand(1) < self.epsilon:
-            return self.env.action_space.sample(), True
-
-        with torch.no_grad():
-            state = state.to(self.device)
-            action = self.q_net(self.preprocess(state)).argmax().item()
-
-        return action, False
+    @torch.no_grad()
+    def select_action(self, state, noise_std=0.1):
+        state = state.to(self.device)
+        action = self.Q_Actor(state).cpu().numpy()
+        noise = np.random.normal(loc=0.0, scale=noise_std, size=action.shape)
+        explor_action = np.clip(action + noise, self.env.action_space.low, self.env.action_space.high)
+        return explor_action.astype(np.float32)
 
     def n_step_sliding_window(self):
         n_return = gamma_pow = 0
@@ -195,13 +191,13 @@ class DQN:
         self.n_step_buffer.popleft()
 
     def collect_data(self, state):        
-        action, random_action_flag = self.select_action(state)
+        action = self.select_action(state)
 
         final_reward = -100
         total_reward = 0
 
         next_observation, reward, terminated, truncated, _ = self.env.step(action)
-        next_state = torch.tensor(next_observation)
+        next_state = torch.tensor(next_observation, dtype=torch.float32)
 
         self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated])
 
@@ -217,26 +213,23 @@ class DQN:
         if terminated:
             final_reward = reward
 
-        return next_state, terminated, truncated, final_reward, total_reward, random_action_flag
+        return next_state, terminated, truncated, final_reward, total_reward
 
-
-    def update_t_net(self):
-        self.t_net.load_state_dict(self.q_net.state_dict())
+    @torch.no_grad()
+    def update_t_nets(self):
+        for online_net, target_net in ((self.Q_Actor, self.T_Actor), (self.Q_Critic, self.T_Critic)):
+            for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
+                target_param.mul_(1 - self.tau_update_t_nets)
+                target_param.add_(online_param, alpha=self.tau_update_t_nets)
 
     @torch.no_grad()
     def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
-        if not self.double_dqn_flag:
-            next_q_vector = self.t_net(self.preprocess(next_state))
-            next_q_value = next_q_vector.max(dim=-1).values
-        else:
-            next_q_vector = self.q_net(self.preprocess(next_state))
-            action = next_q_vector.argmax(dim=-1).unsqueeze(1)
-            next_q_value = self.t_net(self.preprocess(next_state)).gather(dim=1, index=action).squeeze(1)
+        next_action = self.T_Actor(next_state)
+        next_q_value = self.T_Critic(next_state, next_action)
         target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * next_q_value)
-                        
         return target
 
-    def update_q_net(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
+    def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
@@ -244,64 +237,77 @@ class DQN:
         terminated = terminated.to(self.device)
         gamma_pow = gamma_pow.to(self.device)
 
-        q_value = self.q_net(self.preprocess(state))
-        q_value = q_value.gather(dim=1, index=action.unsqueeze(1)).squeeze(1)
+        q_value = self.Q_Critic(state, action)
         target = self.compute_target(next_state, reward, terminated, gamma_pow)
-        raw_loss = self.loss_fn(q_value, target)
+        critic_raw_loss = self.loss_fn(q_value, target)
         
         buffer_prior = torch.abs(target - q_value).detach().cpu().numpy()
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
         weight = weight / weight.max()
 
-        loss = (weight * raw_loss).mean()
+        critic_loss = (weight * critic_raw_loss).mean()
         
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
         
         self.replay_buffer.change_priority(indx, buffer_prior)
 
-        return loss.item()
+        return critic_loss.item()
+
+    def update_q_actor(self, state):
+        state = state.to(self.device)
+        self.Q_Critic.requires_grad_(False)
+
+        policy_action = self.Q_Actor(state)
+        policy_q_value = self.Q_Critic(state, policy_action)
+        actor_loss = -policy_q_value.mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        self.Q_Critic.requires_grad_(True)
+        return actor_loss.item()
 
     def fit(self):
         max_position_lst = []
         min_position_lst = []
         metric_time = 0
-        success_rate = 0
         
         for episode in range(1, self.episodes+1):
             start_time = time.time()
             
             observation, info = self.env.reset()
-            state = torch.tensor(observation)
+            state = torch.tensor(observation, dtype=torch.float32)
             terminated = truncated = False  
             max_position = min_position = observation[0]
 
             episod_return = 0
+            episode_steps = 0
             while not (terminated or truncated):
-                next_state, terminated, truncated, final_reward, total_reward, random_action_flag = self.collect_data(state)
+                next_state, terminated, truncated, final_reward, total_reward = self.collect_data(state)
                 state = next_state
                 episod_return += total_reward
-
+                episode_steps += 1
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
                     batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities = self.replay_buffer.sample(self.batch_size)
-                    loss = self.update_q_net(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
+                    critic_loss = self.update_q_critic(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
+                    actor_loss = self.update_q_actor(batch_state)
+                    self.update_t_nets()
                     
-                    self.history['loss'].append(loss)
+                    self.history['critic_loss'].append(critic_loss)
+                    self.history['actor_loss'].append(actor_loss)
                     
                     self.update_steps += 1
 
-                    if self.update_steps % self.target_update_interval == 0:
-                        self.update_t_net()
- 
             self.history['return'].append(episod_return)
 
-            if terminated and final_reward == 100:
-                    success_rate += 1                
-
-            if episode % 100 == 0 and success_rate > 10:
-                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            max_steps = self.env.spec.max_episode_steps
+            success = (not terminated and truncated and episode_steps >= max_steps)
+            self.history['episode_success'].append(bool(success))
+            self.history['episode_length'].append(episode_steps)
 
             if episode % 100 == 0:
                 self.beta_per_weight = min(1, self.beta_per_weight * self.beta_per_weight_decay)
@@ -311,13 +317,16 @@ class DQN:
             metric_time += end_time - start_time
             
             if episode % 100  == 0:
-                self.metrics(episode, max_position_lst, min_position_lst, metric_time, success_rate)
-                self.history['success_rate'].append(success_rate)
-                self.history['epsilon'].append(self.epsilon)
-                success_rate = 0
+                self.metrics(episode, metric_time)
 
-    def metrics(self, episode, max_position_lst, min_position_lst, metric_time, success_rate):
+    def metrics(self, episode, metric_time):
+        recent_success = self.history['episode_success'][-100:]
+        success_rate = 100 * np.mean(recent_success)
+        self.history['success_rate'].append(success_rate)
+        recent_length = self.history['episode_length'][-100:]
+        recent_return = self.history['return'][-100:]
         print(f'episod: {episode}, success rate: {success_rate}%')
-        print(f'mean return: {sum(self.history['return'][-100:]) / 100}')
-        print(f'epsilon: {self.epsilon}, time: {metric_time // 60} min')
+        print(f'mean_episode_length: {np.mean(recent_length)}')
+        print(f'mean return: {np.mean(recent_return) / 100}')
+        print(f'time: {metric_time // 60} min')
         print('-'*50)
