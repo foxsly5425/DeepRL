@@ -87,7 +87,7 @@ class critic(nn.Module):
         return  self.net(x).squeeze(-1)
 
 class ReplayBuffer:
-    def __init__(self, max_size, state_dim, action_dim, alpha, epsilon, max_priority=1.0):
+    def __init__(self, max_size, state_dim, action_dim, alpha, epsilon, max_priority=1.0, n_step_return=1):
         self.max_size = max_size
         self.last_pos = 0
         self.size = 0
@@ -99,13 +99,14 @@ class ReplayBuffer:
         self.terminated = np.empty(self.max_size, dtype=np.bool_)
         self.priorities = np.empty(self.max_size, dtype=np.float64)
         self.gamma_pow = np.empty(self.max_size, dtype=np.int32)
+        self.intermediate_state  = np.empty((self.max_size, n_step_return - 1, state_dim), dtype=np.float32)
 
         self.max_priority = max_priority
         self.alpha = alpha
         self.epsilon = epsilon
         
     def append(self, data):
-        state, action, reward, next_state, terminated, gamma_pow = data
+        state, action, reward, next_state, terminated, gamma_pow, intermediate_state = data
 
         self.states[self.last_pos] = np.asarray(state, dtype=np.float32)
         self.actions[self.last_pos] = action
@@ -114,7 +115,8 @@ class ReplayBuffer:
         self.terminated[self.last_pos] = terminated
         self.priorities[self.last_pos] = self.max_priority
         self.gamma_pow[self.last_pos] = gamma_pow
-
+        self.intermediate_state[self.last_pos] = intermediate_state
+            
         self.last_pos = (self.last_pos + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         
@@ -138,6 +140,7 @@ class ReplayBuffer:
             torch.from_numpy(self.next_states[indx]),
             torch.from_numpy(self.terminated[indx]),
             torch.from_numpy(self.gamma_pow[indx]),
+            torch.from_numpy(self.intermediate_state[indx]),
             torch.as_tensor(probabilities[indx], dtype=torch.float32),
         )
 
@@ -187,7 +190,7 @@ class SAC:
                                                  list(self.Q2_Critic.parameters()), lr=lr)
 
         self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, state_dim=self.state_dim, action_dim=self.action_dim,
-                                          alpha=alpha_buffer, epsilon=epsilon_buffer)
+                                          alpha=alpha_buffer, epsilon=epsilon_buffer, n_step_return=self.n_step_return)
         self.beta_per_weight = beta_per_weight
         self.beta_per_weight_decay = beta_per_weight_decay
         self.buffer_size_for_start_train = buffer_size_for_start_train
@@ -238,21 +241,20 @@ class SAC:
     def n_step_sliding_window(self):
         n_return = gamma_pow = 0
         first_state, first_action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
+        intermediate_state = np.zeros((self.n_step_return - 1, self.state_dim), dtype=np.float32)
+                                      
         for i in range(self.n_step_return):
             _, _, reward, next_state, terminated, truncated = self.n_step_buffer[i]
-            if i > 0:
-                n_return += (self.gamma ** gamma_pow) * (reward - self.alpha_explore * log_prob)
-            else:
-                n_return += reward
+            n_return += (self.gamma ** gamma_pow) * reward
             gamma_pow += 1
 
             if truncated or terminated:
                 break
 
             if i < self.n_step_return - 1:
-                _, log_prob = self.Q_Actor.sample(torch.as_tensor(next_state, dtype=torch.float32))
+                intermediate_state[i] = np.asarray(next_state, dtype=np.float32)
 
-        self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow])
+        self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow, intermediate_state])
         self.n_step_buffer.popleft()
 
     def collect_data(self, state):        
@@ -292,31 +294,45 @@ class SAC:
                 target_param.add_(online_param, alpha=self.tau_update_t_nets)
                 
     @torch.no_grad()
-    def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
+    def compute_target(self, next_state, n_step_return, terminated, gamma_pow, intermediate_state):
         # normalize_next_state = self.preprocess(next_state)
         normalize_next_state = next_state
+        soft_return = n_step_return.clone()
+        
+        for j in range(intermediate_state.shape[1]):
+            step = j + 1
+            valid = gamma_pow > step
+
+            if not valid.any():
+                continue
+            
+            state = intermediate_state[valid, j, :]
+            _, log_prob = self.Q_Actor.sample(state)
+            soft_return[valid] -= self.gamma ** (step) * self.alpha_explore * log_prob
+            
         next_action, next_log_prob = self.Q_Actor.sample(normalize_next_state)
-                    
         next_q1_value = self.T1_Critic(normalize_next_state, next_action)
         next_q2_value = self.T2_Critic(normalize_next_state, next_action)
-        target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * 
+        
+        target = torch.where(terminated, soft_return, soft_return + (self.gamma ** gamma_pow) * 
                              (torch.minimum(next_q1_value, next_q2_value) - self.alpha_explore * next_log_prob))
         return target
 
-    def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
+    def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, intermediate_state, probailities):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
         next_state = next_state.to(self.device)
         terminated = terminated.to(self.device)
         gamma_pow = gamma_pow.to(self.device)
+        intermediate_state = intermediate_state.to(self.device)
         
         # normalize_state = self.preprocess(state)
         normalize_state = state
         q1_value = self.Q1_Critic(normalize_state, action)
         q2_value = self.Q2_Critic(normalize_state, action)
 
-        target = self.compute_target(next_state, reward, terminated, gamma_pow)
+        target = self.compute_target(next_state, reward, terminated, gamma_pow, intermediate_state)
         critic_raw_loss = self.loss_fn(q1_value, target) + self.loss_fn(q2_value, target)
         
         buffer_prior = torch.maximum(torch.abs(target - q1_value), 
@@ -379,9 +395,11 @@ class SAC:
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
                     batch_indx, batch_state, batch_action, batch_reward, batch_next_state, \
-                                batch_terminated, batch_gamma_pow, batch_probabilities = self.replay_buffer.sample(self.batch_size)
+                                batch_terminated, batch_gamma_pow, batch_intermediate_state, \
+                                batch_probabilities = self.replay_buffer.sample(self.batch_size)
                     critic_loss = self.update_q_critic(batch_indx, batch_state, batch_action, batch_reward,
-                                                       batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
+                                                       batch_next_state, batch_terminated, batch_gamma_pow, 
+                                                       batch_intermediate_state, batch_probabilities)
                     self.history['critic_loss'].append(critic_loss)
                     self.update_steps += 1
 
