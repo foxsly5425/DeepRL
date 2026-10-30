@@ -51,21 +51,34 @@ class actor(nn.Module):
         log_std = self.log_std_head(x).clamp(-20, 2)
         return mu, log_std
 
-    def sample(self, x):
+    def compute_distribution(self, x):
         mu, log_std = self.forward(x)
         std = torch.exp(log_std)
         distribution = Normal(mu, std)
-        
-        z = distribution.rsample()
-        normalized_action = torch.tanh(z)
-        action = self.action_bias + self.action_scale * normalized_action
-        
+        return distribution
+
+    def compute_log_prob(self, distribution, z):
         log_prob = distribution.log_prob(z)
         log_tanh_jacobian = 2 * (math.log(2) - z - F.softplus(-2*z))
         log_prob = log_prob - log_tanh_jacobian - torch.log(self.action_scale)
         log_prob = log_prob.sum(dim=-1)
-
+        return log_prob
+        
+    def sample(self, x):
+        distribution = self.compute_distribution(x)
+        z = distribution.rsample()
+        normalized_action = torch.tanh(z)
+        action = self.action_bias + self.action_scale * normalized_action
+        log_prob = self.compute_log_prob(distribution, z)
         return action, log_prob
+
+    def get_log_prob(self, state, action, eps=1e-6):
+        distribution = self.compute_distribution(state)
+        normalized_action = (action - self.action_bias) / self.action_scale 
+        normalized_action = normalized_action.clamp(-1+eps, 1-eps)
+        z = torch.atanh(normalized_action)
+        log_prob = self.compute_log_prob(distribution, z)
+        return log_prob
         
 
 class critic(nn.Module):
@@ -100,13 +113,15 @@ class ReplayBuffer:
         self.priorities = np.empty(self.max_size, dtype=np.float64)
         self.gamma_pow = np.empty(self.max_size, dtype=np.int32)
         self.intermediate_state  = np.empty((self.max_size, n_step_return - 1, state_dim), dtype=np.float32)
-
+        self.intermediate_behavior_log_prob = np.empty((self.max_size, n_step_return - 1), dtype=np.float32)
+        self.intermediate_action = np.empty((self.max_size, n_step_return - 1, action_dim), dtype=np.float32)
         self.max_priority = max_priority
         self.alpha = alpha
         self.epsilon = epsilon
         
     def append(self, data):
-        state, action, reward, next_state, terminated, gamma_pow, intermediate_state = data
+        state, action, reward, next_state, terminated, gamma_pow, \
+        intermediate_state, intermediate_action, intermediate_behavior_log_prob = data
 
         self.states[self.last_pos] = np.asarray(state, dtype=np.float32)
         self.actions[self.last_pos] = action
@@ -116,7 +131,9 @@ class ReplayBuffer:
         self.priorities[self.last_pos] = self.max_priority
         self.gamma_pow[self.last_pos] = gamma_pow
         self.intermediate_state[self.last_pos] = intermediate_state
-            
+        self.intermediate_action[self.last_pos] = intermediate_action
+        self.intermediate_behavior_log_prob[self.last_pos] = intermediate_behavior_log_prob
+        
         self.last_pos = (self.last_pos + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
         
@@ -141,6 +158,8 @@ class ReplayBuffer:
             torch.from_numpy(self.terminated[indx]),
             torch.from_numpy(self.gamma_pow[indx]),
             torch.from_numpy(self.intermediate_state[indx]),
+            torch.from_numpy(self.intermediate_action[indx]),
+            torch.from_numpy(self.intermediate_behavior_log_prob[indx]),
             torch.as_tensor(probabilities[indx], dtype=torch.float32),
         )
 
@@ -233,33 +252,40 @@ class SAC:
         if deterministic:
             mu, _ = self.Q_Actor(normalize_state)
             action = (self.Q_Actor.action_bias + self.Q_Actor.action_scale * torch.tanh(mu))
+            behavior_log_prob = None
         else:
-            action, _ = self.Q_Actor.sample(normalize_state)
-        return action.cpu().numpy().astype(np.float32)
+            action, behavior_log_prob = self.Q_Actor.sample(normalize_state)
+            behavior_log_prob.cpu().numpy().astype(np.float32)
+        return action.cpu().numpy().astype(np.float32), behavior_log_prob
 
     @torch.no_grad()
     def n_step_sliding_window(self):
         n_return = gamma_pow = 0
         first_state, first_action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
+        intermediate_action = np.zeros((self.n_step_return - 1, self.action_dim), dtype=np.float32)
+        intermediate_behavior_log_prob = np.zeros(self.n_step_return - 1, dtype=np.float32)
         intermediate_state = np.zeros((self.n_step_return - 1, self.state_dim), dtype=np.float32)
                                       
         for i in range(self.n_step_return):
-            _, _, reward, next_state, terminated, truncated = self.n_step_buffer[i]
+            state, action, reward, next_state, terminated, truncated, behavior_log_prob = self.n_step_buffer[i]
             n_return += (self.gamma ** gamma_pow) * reward
             gamma_pow += 1
+
+            if i > 0:
+                intermediate_action[i-1] = np.asarray(action, dtype=np.float32)
+                intermediate_behavior_log_prob[i-1] = np.asarray(behavior_log_prob, dtype=np.float32)
+                intermediate_state[i-1] = np.asarray(state, dtype=np.float32)
 
             if truncated or terminated:
                 break
 
-            if i < self.n_step_return - 1:
-                intermediate_state[i] = np.asarray(next_state, dtype=np.float32)
-
-        self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow, intermediate_state])
+        self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow, 
+                                   intermediate_state, intermediate_action, intermediate_behavior_log_prob])
         self.n_step_buffer.popleft()
 
     def collect_data(self, state):        
-        action = self.select_action(state)
-
+        action, behavior_log_prob = self.select_action(state)
+            
         final_reward = -100
         total_reward = 0
 
@@ -268,15 +294,14 @@ class SAC:
         
         next_state = torch.tensor(next_observation, dtype=torch.float32)
 
-        self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated])
+        self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated, behavior_log_prob])
 
         if terminated or truncated:
             while self.n_step_buffer:
                 self.n_step_sliding_window()
         elif len(self.n_step_buffer) == self.n_step_return:
             self.n_step_sliding_window()
-            
-            
+        
         state = next_state
 
         total_reward += reward
@@ -307,7 +332,8 @@ class SAC:
                 continue
             
             state = intermediate_state[valid, j, :]
-            _, log_prob = self.Q_Actor.sample(state)
+            action, log_prob = self.Q_Actor.sample(state)
+            
             soft_return[valid] -= self.gamma ** (step) * self.alpha_explore * log_prob
             
         next_action, next_log_prob = self.Q_Actor.sample(normalize_next_state)
@@ -318,7 +344,9 @@ class SAC:
                              (torch.minimum(next_q1_value, next_q2_value) - self.alpha_explore * next_log_prob))
         return target
 
-    def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, intermediate_state, probailities):
+    def update_q_critic(self, indx, state, action, reward, next_state, terminated, 
+                        gamma_pow, intermediate_state, intermediate_action, 
+                        intermediate_behavior_log_prob, probailities, ):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
@@ -326,6 +354,39 @@ class SAC:
         terminated = terminated.to(self.device)
         gamma_pow = gamma_pow.to(self.device)
         intermediate_state = intermediate_state.to(self.device)
+        intermediate_action = intermediate_action.to(self.device)
+        intermediate_behavior_log_prob = intermediate_behavior_log_prob.to(self.device)
+
+        with torch.no_grad():
+            steps = torch.arange(1, intermediate_behavior_log_prob.shape[1] + 1, device=self.device)
+            valid = steps.unsqueeze(0) < gamma_pow.unsqueeze(1)
+            log_ratios = torch.zeros_like(intermediate_behavior_log_prob)
+            
+            if valid.any():
+                current_log_prob = self.Q_Actor.get_log_prob(intermediate_state[valid], intermediate_action[valid])
+                log_ratios[valid] = current_log_prob - intermediate_behavior_log_prob[valid]
+
+            log_rho = log_ratios.sum(dim=1)
+            q = 0.75
+
+            sorted_logs = log_rho.sort().values
+            position = q * (sorted_logs.numel() - 1)
+            lower = math.floor(position)
+            upper = math.ceil(position)
+
+            if lower == upper:
+                log_cap = sorted_logs[lower]
+            else:
+                fraction = position - lower
+                log_cap = torch.logaddexp(sorted_logs[lower] + math.log(1 - fraction), 
+                                          sorted_logs[upper] + math.log(fraction))
+                
+            clipped_log_rho = torch.minimum(log_rho, log_cap)
+            normalized_clipped_log_rho = clipped_log_rho - clipped_log_rho.max()
+            rho = normalized_clipped_log_rho.exp()
+            
+        intermediate_current_log_prob = self.Q_Actor.get_log_prob(intermediate_state, intermediate_action)
+        intermediate_pho = torch.exp(intermediate_current_log_prob - intermediate_behavior_log_prob)
         
         # normalize_state = self.preprocess(state)
         normalize_state = state
@@ -340,7 +401,7 @@ class SAC:
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
         weight = weight / weight.max()
 
-        critic_loss = (weight * critic_raw_loss).mean()
+        critic_loss = (weight * rho * critic_raw_loss).mean()
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -361,7 +422,7 @@ class SAC:
         policy_q1_value = self.Q1_Critic(normalize_state, policy_action)
         policy_q2_value = self.Q2_Critic(normalize_state, policy_action)
 
-        actor_loss = -(torch.minimum(policy_q1_value, policy_q2_value) - self.alpha_explore * policy_log_prob).mean()
+        actor_loss = - (torch.minimum(policy_q1_value, policy_q2_value) - self.alpha_explore * policy_log_prob).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -394,12 +455,12 @@ class SAC:
                 episode_steps += 1
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
-                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, \
-                                batch_terminated, batch_gamma_pow, batch_intermediate_state, \
-                                batch_probabilities = self.replay_buffer.sample(self.batch_size)
-                    critic_loss = self.update_q_critic(batch_indx, batch_state, batch_action, batch_reward,
-                                                       batch_next_state, batch_terminated, batch_gamma_pow, 
-                                                       batch_intermediate_state, batch_probabilities)
+                    # batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, \
+                    #                          batch_gamma_pow, batch_intermediate_state, batch_probabilities, \
+                    #                          batch_behavior_log_prob = self.replay_buffer.sample(self.batch_size)
+                    batch = self.replay_buffer.sample(self.batch_size)
+                    batch_state = batch[1]
+                    critic_loss = self.update_q_critic(*batch)
                     self.history['critic_loss'].append(critic_loss)
                     self.update_steps += 1
 
@@ -441,7 +502,7 @@ class SAC:
             state = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
             normalize_state = self.preprocess(state)
             
-            action = self.Q_Actor(normalize_state).cpu().numpy()
+            action = self.Q_Actor(normalize_state, deterministic=True).cpu().numpy()
             observation, reward, terminated, truncated, _ = self.env.step(action)
                         
             episode_reward += reward
