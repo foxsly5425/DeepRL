@@ -115,13 +115,15 @@ class ReplayBuffer:
         self.intermediate_state  = np.empty((self.max_size, n_step_return - 1, state_dim), dtype=np.float32)
         self.intermediate_behavior_log_prob = np.empty((self.max_size, n_step_return - 1), dtype=np.float32)
         self.intermediate_action = np.empty((self.max_size, n_step_return - 1, action_dim), dtype=np.float32)
+        self.intermediate_n_return = np.empty((self.max_size, n_step_return - 1), dtype=np.float32)
         self.max_priority = max_priority
         self.alpha = alpha
         self.epsilon = epsilon
         
     def append(self, data):
         state, action, reward, next_state, terminated, gamma_pow, \
-        intermediate_state, intermediate_action, intermediate_behavior_log_prob = data
+        intermediate_state, intermediate_action, intermediate_behavior_log_prob, \
+        intermediate_n_return = data
 
         self.states[self.last_pos] = np.asarray(state, dtype=np.float32)
         self.actions[self.last_pos] = action
@@ -133,6 +135,7 @@ class ReplayBuffer:
         self.intermediate_state[self.last_pos] = intermediate_state
         self.intermediate_action[self.last_pos] = intermediate_action
         self.intermediate_behavior_log_prob[self.last_pos] = intermediate_behavior_log_prob
+        self.intermediate_n_return[self.last_pos] = intermediate_n_return
         
         self.last_pos = (self.last_pos + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
@@ -160,6 +163,7 @@ class ReplayBuffer:
             torch.from_numpy(self.intermediate_state[indx]),
             torch.from_numpy(self.intermediate_action[indx]),
             torch.from_numpy(self.intermediate_behavior_log_prob[indx]),
+            torch.from_numpy(self.intermediate_n_return[indx]),
             torch.as_tensor(probabilities[indx], dtype=torch.float32),
         )
 
@@ -167,8 +171,8 @@ class ReplayBuffer:
         return self.size
         
 class SAC:
-    def __init__(self, env, episodes=10000, batch_size=64, device='cpu', 
-                gamma=0.99, lr=1e-3, buffer_size_for_start_train=2000, 
+    def __init__(self, env, episodes=10000, batch_size=256, device='cpu', 
+                gamma=0.99, lr=3*1e-4, buffer_size_for_start_train=2000, 
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
                 n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, alpha_explore=0.2):
         
@@ -255,7 +259,7 @@ class SAC:
             behavior_log_prob = None
         else:
             action, behavior_log_prob = self.Q_Actor.sample(normalize_state)
-            behavior_log_prob.cpu().numpy().astype(np.float32)
+            behavior_log_prob = behavior_log_prob.item()
         return action.cpu().numpy().astype(np.float32), behavior_log_prob
 
     @torch.no_grad()
@@ -265,22 +269,26 @@ class SAC:
         intermediate_action = np.zeros((self.n_step_return - 1, self.action_dim), dtype=np.float32)
         intermediate_behavior_log_prob = np.zeros(self.n_step_return - 1, dtype=np.float32)
         intermediate_state = np.zeros((self.n_step_return - 1, self.state_dim), dtype=np.float32)
-                                      
+        intermediate_n_return = np.zeros(self.n_step_return - 1, dtype=np.float32)
+                                         
         for i in range(self.n_step_return):
             state, action, reward, next_state, terminated, truncated, behavior_log_prob = self.n_step_buffer[i]
-            n_return += (self.gamma ** gamma_pow) * reward
-            gamma_pow += 1
 
             if i > 0:
                 intermediate_action[i-1] = np.asarray(action, dtype=np.float32)
                 intermediate_behavior_log_prob[i-1] = np.asarray(behavior_log_prob, dtype=np.float32)
                 intermediate_state[i-1] = np.asarray(state, dtype=np.float32)
+                intermediate_n_return[i-1] = np.asarray(n_return, dtype=np.float32)
+        
+            n_return += (self.gamma ** gamma_pow) * reward
+            gamma_pow += 1
 
             if truncated or terminated:
                 break
 
         self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow, 
-                                   intermediate_state, intermediate_action, intermediate_behavior_log_prob])
+                                   intermediate_state, intermediate_action, intermediate_behavior_log_prob,
+                                   intermediate_n_return])
         self.n_step_buffer.popleft()
 
     def collect_data(self, state):        
@@ -319,11 +327,44 @@ class SAC:
                 target_param.add_(online_param, alpha=self.tau_update_t_nets)
                 
     @torch.no_grad()
-    def compute_target(self, next_state, n_step_return, terminated, gamma_pow, intermediate_state):
+    def compute_target(self, next_state, n_step_return, terminated, gamma_pow,
+                       intermediate_state, intermediate_n_return):
+
+        batch_size = intermediate_state.shape[0]
+        num_intermediate = intermediate_state.shape[1]
+
+        intermediate_valid = torch.zeros(num_intermediate, batch_size, dtype=torch.bool, device=self.device)
+        intermediate_target = torch.zeros(num_intermediate, batch_size, dtype=torch.float32, device=self.device)
+        
+        for i in range(self.n_step_return-1):
+            step = i + 1
+            valid = gamma_pow > step
+
+            if not valid.any():
+                continue
+
+            intermediate_valid[i] = valid
+            soft_i_return = intermediate_n_return[valid, i].clone()
+
+            for j in range(i):
+                state = intermediate_state[valid, j, :]
+                _, logprob = self.Q_Actor.sample(state)
+                soft_i_return -= self.gamma ** (j + 1) * self.alpha_explore * logprob
+
+            inter_next_state = intermediate_state[valid, i]
+            inter_next_action, inter_next_logprob = self.Q_Actor.sample(inter_next_state)
+
+            inter_next_q1_value = self.T1_Critic(inter_next_state, inter_next_action)
+            inter_next_q2_valie = self.T2_Critic(inter_next_state, inter_next_action)
+
+            inter_i_target = soft_i_return + self.gamma ** (step) * \
+                            (torch.minimum(inter_next_q1_value, inter_next_q2_valie)
+                             - self.alpha_explore * inter_next_logprob)
+            intermediate_target[i, valid] = inter_i_target
+
         # normalize_next_state = self.preprocess(next_state)
         normalize_next_state = next_state
         soft_return = n_step_return.clone()
-        
         for j in range(intermediate_state.shape[1]):
             step = j + 1
             valid = gamma_pow > step
@@ -332,21 +373,22 @@ class SAC:
                 continue
             
             state = intermediate_state[valid, j, :]
-            action, log_prob = self.Q_Actor.sample(state)
+            _, log_prob = self.Q_Actor.sample(state)
             
             soft_return[valid] -= self.gamma ** (step) * self.alpha_explore * log_prob
-            
+        
         next_action, next_log_prob = self.Q_Actor.sample(normalize_next_state)
         next_q1_value = self.T1_Critic(normalize_next_state, next_action)
         next_q2_value = self.T2_Critic(normalize_next_state, next_action)
-        
+
         target = torch.where(terminated, soft_return, soft_return + (self.gamma ** gamma_pow) * 
                              (torch.minimum(next_q1_value, next_q2_value) - self.alpha_explore * next_log_prob))
-        return target
-
+        
+        return intermediate_target, target, intermediate_valid
+        
     def update_q_critic(self, indx, state, action, reward, next_state, terminated, 
                         gamma_pow, intermediate_state, intermediate_action, 
-                        intermediate_behavior_log_prob, probailities, ):
+                        intermediate_behavior_log_prob, intermediate_n_return, probailities, ):
         state = state.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
@@ -356,52 +398,68 @@ class SAC:
         intermediate_state = intermediate_state.to(self.device)
         intermediate_action = intermediate_action.to(self.device)
         intermediate_behavior_log_prob = intermediate_behavior_log_prob.to(self.device)
-
+        intermediate_n_return = intermediate_n_return.to(self.device)
+        
+        # normalize_state = self.preprocess(state)
+        normalize_state = state
+        q1_value = self.Q1_Critic(normalize_state, action)
+        q2_value = self.Q2_Critic(normalize_state, action)
+            
+        intermediate_target, target, intermediate_valid = self.compute_target(next_state, reward, terminated, gamma_pow, 
+                                                                              intermediate_state, intermediate_n_return)
         with torch.no_grad():
-            steps = torch.arange(1, intermediate_behavior_log_prob.shape[1] + 1, device=self.device)
+            batch_size, num_intermediate = intermediate_behavior_log_prob.shape[0], intermediate_behavior_log_prob.shape[1]
+            steps = torch.arange(1, num_intermediate + 1, device=self.device)
+            # нужна маска для правильно обработки концов траекторий, где количество шагов уже меньше заданного
             valid = steps.unsqueeze(0) < gamma_pow.unsqueeze(1)
             log_ratios = torch.zeros_like(intermediate_behavior_log_prob)
             
             if valid.any():
                 current_log_prob = self.Q_Actor.get_log_prob(intermediate_state[valid], intermediate_action[valid])
                 log_ratios[valid] = current_log_prob - intermediate_behavior_log_prob[valid]
-
-            log_rho = log_ratios.sum(dim=1)
-            q = 0.75
-
-            sorted_logs = log_rho.sort().values
-            position = q * (sorted_logs.numel() - 1)
+    
+            prefix_log_rho = torch.cat([log_ratios.new_zeros((batch_size, 1)), log_ratios.cumsum(dim=1)], dim=1)
+            # cumsum переносит log_rho дальше даже в случае окончания тректории, поэтому нужно снова применить маску
+            prefix_valid = torch.cat([valid.new_ones((batch_size, 1)), valid], dim=1)
+            masked_prefix_log_rho = prefix_log_rho.masked_fill(~prefix_valid, -torch.inf)
+            
+            valid_log_rho = prefix_log_rho[prefix_valid]
+            sort_log_rho = valid_log_rho.sort().values
+            quantile = 0.75
+            position = quantile * (sort_log_rho.numel() - 1)
             lower = math.floor(position)
             upper = math.ceil(position)
-
             if lower == upper:
-                log_cap = sorted_logs[lower]
+                log_cap = sort_log_rho[lower]
             else:
                 fraction = position - lower
-                log_cap = torch.logaddexp(sorted_logs[lower] + math.log(1 - fraction), 
-                                          sorted_logs[upper] + math.log(fraction))
+                log_cap = torch.logaddexp(sort_log_rho[lower] + math.log(1 - fraction), 
+                                          sort_log_rho[upper] + math.log(fraction))
                 
-            clipped_log_rho = torch.minimum(log_rho, log_cap)
-            normalized_clipped_log_rho = clipped_log_rho - clipped_log_rho.max()
-            rho = normalized_clipped_log_rho.exp()
+            truncated_log_rho = torch.minimum(masked_prefix_log_rho, log_cap)
+            max_truncated_log_rho = truncated_log_rho.max(dim=0, keepdim=True).values
+            max_truncated_log_rho = torch.where(prefix_valid.any(dim=0, keepdim=True), 
+                                                max_truncated_log_rho, torch.zeros_like(max_truncated_log_rho))
             
-        intermediate_current_log_prob = self.Q_Actor.get_log_prob(intermediate_state, intermediate_action)
-        intermediate_pho = torch.exp(intermediate_current_log_prob - intermediate_behavior_log_prob)
-        
-        # normalize_state = self.preprocess(state)
-        normalize_state = state
-        q1_value = self.Q1_Critic(normalize_state, action)
-        q2_value = self.Q2_Critic(normalize_state, action)
+            normalized_truncated_log_rho = truncated_log_rho - max_truncated_log_rho        
+            rho = normalized_truncated_log_rho.exp()
 
-        target = self.compute_target(next_state, reward, terminated, gamma_pow, intermediate_state)
-        critic_raw_loss = self.loss_fn(q1_value, target) + self.loss_fn(q2_value, target)
+        all_targets = torch.cat([intermediate_target.T, target.unsqueeze(1)], dim=1)
+        rows = torch.arange(batch_size, device=self.device)
+        cols = gamma_pow - 1
+        all_targets[rows, cols] = target
+
+        critic_raw_loss = (q1_value.unsqueeze(1) - all_targets).square() + (q2_value.unsqueeze(1) - all_targets).square()
         
         buffer_prior = torch.maximum(torch.abs(target - q1_value), 
                                      torch.abs(target - q2_value)).detach().cpu().numpy()
+        
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
         weight = weight / weight.max()
 
-        critic_loss = (weight * rho * critic_raw_loss).mean()
+        weighted_loss = weight.unsqueeze(1) * rho * critic_raw_loss
+        masked_weighted_loss = weighted_loss.masked_fill(~prefix_valid, 0.0)
+        critic_loss = (masked_weighted_loss.sum(dim=1) / prefix_valid.sum(dim=1)).mean()
         
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
