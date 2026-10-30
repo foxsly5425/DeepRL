@@ -29,31 +29,31 @@ class actor(nn.Module):
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, 64),
-            nn.LayerNorm(64),
+            # nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 64),
-            nn.LayerNorm(64),
+            # nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, action_dim),
         )
-
+        
     def forward(self, x):
         return  3 * F.tanh(self.net(x))
 
 class critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-            
+        
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, 64),
-            nn.LayerNorm(64),
+            # nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 64),
-            nn.LayerNorm(64),
+            # nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
-
+        
     def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
         return  self.net(x).squeeze(-1)
@@ -116,12 +116,12 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
         
-class DDPG:
-    def __init__(self, env, episodes=10000, batch_size=64, device='cpu',
-                gamma=0.99, lr=1e-3, buffer_size_for_start_train=2000,
+class TD3:
+    def __init__(self, env, episodes=10000, batch_size=64, device='cpu', 
+                gamma=0.99, lr=1e-3, buffer_size_for_start_train=2000, 
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
-                n_step_return=1, tau_update_t_nets=0.005):
-
+                n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, target_policy_noise=0.2, target_noise_clip=0.5):
+        
         self.n_step_return = n_step_return 
         self.n_step_buffer = deque()
 
@@ -130,27 +130,37 @@ class DDPG:
         self.action_dim = self.env.action_space.shape[0]
         
         self.device = device
-        
+
         self.Q_Actor = actor(self.state_dim, self.action_dim).to(self.device)
-        self.Q_Critic = critic(self.state_dim, self.action_dim).to(self.device)
+        self.Q1_Critic = critic(self.state_dim, self.action_dim).to(self.device)
+        self.Q2_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         
         self.T_Actor = actor(self.state_dim, self.action_dim).to(self.device)
-        self.T_Critic = critic(self.state_dim, self.action_dim).to(self.device)
-
+        self.T1_Critic = critic(self.state_dim, self.action_dim).to(self.device)
+        self.T2_Critic = critic(self.state_dim, self.action_dim).to(self.device)
+        
         self.T_Actor.load_state_dict(self.Q_Actor.state_dict())
-        self.T_Critic.load_state_dict(self.Q_Critic.state_dict())
-
+        self.T1_Critic.load_state_dict(self.Q1_Critic.state_dict())
+        self.T2_Critic.load_state_dict(self.Q2_Critic.state_dict())
+        
         self.T_Actor.requires_grad_(False)
-        self.T_Critic.requires_grad_(False)
+        self.T1_Critic.requires_grad_(False)
+        self.T2_Critic.requires_grad_(False)
         self.T_Actor.eval()
-        self.T_Critic.eval()
+        self.T1_Critic.eval()
+        self.T2_Critic.eval()
 
+        self.target_policy_noise = target_policy_noise
+        self.target_noise_clip = target_noise_clip
+        
+        self.policy_delay = policy_delay
         self.tau_update_t_nets = tau_update_t_nets
         
         self.gamma = gamma
         self.loss_fn = nn.MSELoss(reduction='none')
         self.actor_optimizer = torch.optim.Adam(self.Q_Actor.parameters(), lr=lr)
-        self.critic_optimizer = torch.optim.Adam(self.Q_Critic.parameters(), lr=lr)
+        self.critic_optimizer = torch.optim.Adam(list(self.Q1_Critic.parameters()) + 
+                                                 list(self.Q2_Critic.parameters()), lr=lr)
 
         self.replay_buffer = ReplayBuffer(max_size=max_size_buffer, state_dim=self.state_dim, action_dim=self.action_dim,
                                           alpha=alpha_buffer, epsilon=epsilon_buffer)
@@ -167,7 +177,7 @@ class DDPG:
         self.obs_m2 = np.zeros(self.state_dim, dtype=np.float64)
 
         self.history = {'return': [], 'critic_loss': [], 'actor_loss': [], 'success_rate': [],
-                        'episode_success': [], 'episode_length': []}
+                        'episode_success': [], 'episode_length': [], 'eval': dict()}
 
     def update_obs_metrics(self, observation):
         x = np.asarray(observation, dtype=np.float64)
@@ -189,9 +199,11 @@ class DDPG:
         return (obs - mean) / torch.sqrt(variance + 1e-8)
 
     @torch.no_grad()
-    def select_action(self, state, noise_std=0.1):
+    def select_action(self, state, noise_std=0.1, target_flag=False):
         state = state.to(self.device)
-        action = self.Q_Actor(state).cpu().numpy()
+        # normalize_state = self.preprocess(state)
+        normalize_state = state
+        action = self.Q_Actor(normalize_state).cpu().numpy()
         noise = np.random.normal(loc=0.0, scale=noise_std, size=action.shape)
         explor_action = np.clip(action + noise, self.env.action_space.low, self.env.action_space.high)
         return explor_action.astype(np.float32)
@@ -218,7 +230,7 @@ class DDPG:
 
         next_observation, reward, terminated, truncated, _ = self.env.step(action)
         self.update_obs_metrics(next_observation)
-
+        
         next_state = torch.tensor(next_observation, dtype=torch.float32)
 
         self.n_step_buffer.append([state, action, reward, next_state, terminated, truncated])
@@ -228,6 +240,7 @@ class DDPG:
                 self.n_step_sliding_window()
         elif len(self.n_step_buffer) == self.n_step_return:
             self.n_step_sliding_window()
+            
             
         state = next_state
 
@@ -239,17 +252,29 @@ class DDPG:
 
     @torch.no_grad()
     def update_t_nets(self):
-        for online_net, target_net in ((self.Q_Actor, self.T_Actor), (self.Q_Critic, self.T_Critic)):
+        for online_net, target_net in ((self.Q_Actor, self.T_Actor), (self.Q1_Critic, self.T1_Critic), 
+                                      (self.Q2_Critic, self.T2_Critic)):
             for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
                 target_param.mul_(1 - self.tau_update_t_nets)
                 target_param.add_(online_param, alpha=self.tau_update_t_nets)
-
+                
     @torch.no_grad()
     def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
-        normalize_next_state = self.preprocess(next_state)
+        # normalize_next_state = self.preprocess(next_state)
+        normalize_next_state = next_state
         next_action = self.T_Actor(normalize_next_state)
-        next_q_value = self.T_Critic(normalize_next_state, next_action)
-        target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * next_q_value)
+
+        noise = torch.randn_like(next_action) * self.target_policy_noise
+        noise = torch.clamp(noise, -self.target_noise_clip, self.target_noise_clip)
+        
+        action_low = torch.as_tensor(self.env.action_space.low, dtype=torch.float32, device=self.device)
+        action_high = torch.as_tensor(self.env.action_space.high, dtype=torch.float32, device=self.device)
+        next_action_clip = torch.clamp(next_action + noise, action_low, action_high)
+            
+        next_q1_value = self.T1_Critic(normalize_next_state, next_action_clip)
+        next_q2_value = self.T2_Critic(normalize_next_state, next_action_clip)
+        target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * 
+                             torch.minimum(next_q1_value, next_q2_value))
         return target
 
     def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
@@ -259,13 +284,17 @@ class DDPG:
         next_state = next_state.to(self.device)
         terminated = terminated.to(self.device)
         gamma_pow = gamma_pow.to(self.device)
-
-        normalize_state = self.preprocess(state)
-        q_value = self.Q_Critic(normalize_state, action)
-        target = self.compute_target(next_state, reward, terminated, gamma_pow)
-        critic_raw_loss = self.loss_fn(q_value, target)
         
-        buffer_prior = torch.abs(target - q_value).detach().cpu().numpy()
+        # normalize_state = self.preprocess(state)
+        normalize_state = state
+        q1_value = self.Q1_Critic(normalize_state, action)
+        q2_value = self.Q2_Critic(normalize_state, action)
+
+        target = self.compute_target(next_state, reward, terminated, gamma_pow)
+        critic_raw_loss = self.loss_fn(q1_value, target) + self.loss_fn(q2_value, target)
+        
+        buffer_prior = torch.maximum(torch.abs(target - q1_value), 
+                                     torch.abs(target - q2_value)).detach().cpu().numpy()
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
         weight = weight / weight.max()
 
@@ -281,20 +310,21 @@ class DDPG:
 
     def update_q_actor(self, state):
         state = state.to(self.device)
-        self.Q_Critic.requires_grad_(False)
+        self.Q1_Critic.requires_grad_(False)
 
-        normalize_state = self.preprocess(state)
+        # normalize_state = self.preprocess(state)
+        normalize_state = state
         policy_action = self.Q_Actor(normalize_state)
-        policy_q_value = self.Q_Critic(state, policy_action)
-        actor_loss = -policy_q_value.mean()
+        policy_q1_value = self.Q1_Critic(normalize_state, policy_action)
+        actor_loss = -policy_q1_value.mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        self.Q_Critic.requires_grad_(True)
+        self.Q1_Critic.requires_grad_(True)
         return actor_loss.item()
-
+        
     def fit(self):
         max_position_lst = []
         min_position_lst = []
@@ -318,15 +348,17 @@ class DDPG:
                 episode_steps += 1
         
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
-                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities = self.replay_buffer.sample(self.batch_size)
-                    critic_loss = self.update_q_critic(batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
-                    actor_loss = self.update_q_actor(batch_state)
-                    self.update_t_nets()
-                    
+                    batch_indx, batch_state, batch_action, batch_reward, batch_next_state, \
+                                batch_terminated, batch_gamma_pow, batch_probabilities = self.replay_buffer.sample(self.batch_size)
+                    critic_loss = self.update_q_critic(batch_indx, batch_state, batch_action, batch_reward,
+                                                       batch_next_state, batch_terminated, batch_gamma_pow, batch_probabilities)
                     self.history['critic_loss'].append(critic_loss)
-                    self.history['actor_loss'].append(actor_loss)
-                    
                     self.update_steps += 1
+
+                    if self.update_steps % self.policy_delay == 0:
+                        actor_loss = self.update_q_actor(batch_state)
+                        self.update_t_nets()
+                        self.history['actor_loss'].append(actor_loss)
 
             self.history['return'].append(episod_return)
 
@@ -345,6 +377,34 @@ class DDPG:
             if episode % 100  == 0:
                 self.metrics(episode, metric_time)
 
+    @torch.no_grad()
+    def eval(self, seed=42):    
+        observation, _ = self.env.reset(seed=seed)
+        truncated = terminated = False
+
+        key = len(self.history['return'])
+        record = {'actions': [], 'seed': seed, 'return': 0, 'length': 0}
+        
+        record['actions'] = []
+        record['seed'] = seed
+        episode_reward = episode_length = 0
+        
+        while not (truncated or terminated):
+            state = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+            normalize_state = self.preprocess(state)
+            
+            action = self.Q_Actor(normalize_state).cpu().numpy()
+            observation, reward, terminated, truncated, _ = self.env.step(action)
+                        
+            episode_reward += reward
+            episode_length += 1
+            
+            record['actions'].append(action)
+            
+        record['return'] = episode_reward 
+        record['length'] = episode_length
+        self.history['eval'][key] = record
+
     def metrics(self, episode, metric_time):
         recent_success = self.history['episode_success'][-100:]
         success_rate = 100 * np.mean(recent_success)
@@ -353,6 +413,6 @@ class DDPG:
         recent_return = self.history['return'][-100:]
         print(f'episod: {episode}, success rate: {success_rate}%')
         print(f'mean_episode_length: {np.mean(recent_length)}')
-        print(f'mean return: {np.mean(recent_return) / 100}')
+        print(f'mean return: {np.mean(recent_return)}')
         print(f'time: {metric_time // 60} min')
         print('-'*50)
