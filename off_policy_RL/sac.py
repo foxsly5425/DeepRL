@@ -472,10 +472,19 @@ class SAC:
         cols = gamma_pow - 1
         all_targets[rows, cols] = target
 
-        critic_raw_loss = (q1_value.unsqueeze(1) - all_targets).square() + (q2_value.unsqueeze(1) - all_targets).square()
-        
-        buffer_prior = torch.maximum(torch.abs(target - q1_value), 
-                                     torch.abs(target - q2_value)).detach().cpu().numpy()
+        num_valid = prefix_valid.sum(dim=1)
+        delta_1 = q1_value.unsqueeze(1) - all_targets
+        delta_2 = q2_value.unsqueeze(1) - all_targets
+        masked_delta_1 = delta_1.masked_fill(~prefix_valid, 0.0)
+        masked_delta_2 = delta_2.masked_fill(~prefix_valid, 0.0)
+        weighted_delta_1 = rho * masked_delta_1
+        weighted_delta_2 = rho * masked_delta_2
+        effective_delta_1 = weighted_delta_1.sum(dim=1) / num_valid
+        effective_delta_2 = weighted_delta_2.sum(dim=1) / num_valid
+        buffer_prior = torch.maximum(torch.abs(effective_delta_1), 
+                                     torch.abs(effective_delta_2)).detach().cpu().numpy()
+
+        critic_raw_loss = delta_1.square() + delta_2.square()
         
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
         weight = weight / weight.max()
@@ -583,7 +592,7 @@ class SAC:
             state = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
             normalize_state = self.preprocess(state)
             
-            action, _, _ = self.select_action(state, deterministic=True)
+            action = self.select_action(state, deterministic=True)
             observation, reward, terminated, truncated, _ = self.env.step(action)
                         
             episode_reward += reward
