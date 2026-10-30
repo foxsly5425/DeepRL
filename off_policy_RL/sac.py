@@ -24,7 +24,7 @@ else:
     device = torch.device('cpu')
 
 class actor(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, action_low, action_high):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -34,11 +34,39 @@ class actor(nn.Module):
             nn.Linear(64, 64),
             # nn.LayerNorm(64),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
         )
+
+        self.mu_head = nn.Linear(64, action_dim)
+        self.log_std_head = nn.Linear(64, action_dim)
+
+        low = torch.as_tensor(action_low, dtype=torch.float32)
+        high = torch.as_tensor(action_high, dtype=torch.float32)
+
+        self.register_buffer('action_scale', (high - low) / 2)
+        self.register_buffer('action_bias', (high + low) / 2)
         
     def forward(self, x):
-        return  3 * F.tanh(self.net(x))
+        x = self.net(x)
+        mu = self.mu_head(x)
+        log_std = self.log_std_head(x).clamp(-20, 2)
+        return mu, log_std
+
+    def sample(self, x):
+        mu, log_std = self.forward(x)
+        std = torch.exp(log_std)
+        distribution = Normal(mu, std)
+        
+        z = distribution.rsample()
+        normalized_action = torch.tanh(z)
+        action = self.action_bias + self.action_scale * normalized_action
+        
+        log_prob = distribution.log_prob(z)
+        log_tanh_jacobian = 2 * (math.log(2) - z - F.softplus(-2*z))
+        log_prob = log_prob - log_tanh_jacobian - torch.log(self.action_scale)
+        log_prob = log_prob.sum(dim=-1)
+
+        return action, log_prob
+        
 
 class critic(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -116,11 +144,11 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
         
-class TD3:
+class SAC:
     def __init__(self, env, episodes=10000, batch_size=64, device='cpu', 
                 gamma=0.99, lr=1e-3, buffer_size_for_start_train=2000, 
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
-                n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, target_policy_noise=0.2, target_noise_clip=0.5):
+                n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, alpha_explore=0.2):
         
         self.n_step_return = n_step_return 
         self.n_step_buffer = deque()
@@ -131,27 +159,23 @@ class TD3:
         
         self.device = device
 
-        self.Q_Actor = actor(self.state_dim, self.action_dim).to(self.device)
+        self.Q_Actor = actor(self.state_dim, self.action_dim, 
+                             self.env.action_space.low, self.env.action_space.high).to(self.device)
         self.Q1_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         self.Q2_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         
-        self.T_Actor = actor(self.state_dim, self.action_dim).to(self.device)
         self.T1_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         self.T2_Critic = critic(self.state_dim, self.action_dim).to(self.device)
         
-        self.T_Actor.load_state_dict(self.Q_Actor.state_dict())
         self.T1_Critic.load_state_dict(self.Q1_Critic.state_dict())
         self.T2_Critic.load_state_dict(self.Q2_Critic.state_dict())
         
-        self.T_Actor.requires_grad_(False)
         self.T1_Critic.requires_grad_(False)
         self.T2_Critic.requires_grad_(False)
-        self.T_Actor.eval()
         self.T1_Critic.eval()
         self.T2_Critic.eval()
 
-        self.target_policy_noise = target_policy_noise
-        self.target_noise_clip = target_noise_clip
+        self.alpha_explore = alpha_explore
         
         self.policy_delay = policy_delay
         self.tau_update_t_nets = tau_update_t_nets
@@ -199,25 +223,34 @@ class TD3:
         return (obs - mean) / torch.sqrt(variance + 1e-8)
 
     @torch.no_grad()
-    def select_action(self, state, noise_std=0.1, target_flag=False):
+    def select_action(self, state, noise_std=0.1, deterministic=False):
         state = state.to(self.device)
         # normalize_state = self.preprocess(state)
         normalize_state = state
-        action = self.Q_Actor(normalize_state).cpu().numpy()
-        noise = np.random.normal(loc=0.0, scale=noise_std, size=action.shape)
-        explor_action = np.clip(action + noise, self.env.action_space.low, self.env.action_space.high)
-        return explor_action.astype(np.float32)
+        if deterministic:
+            mu, _ = self.Q_Actor(normalize_state)
+            action = (self.Q_Actor.action_bias + self.Q_Actor.action_scale * torch.tanh(mu))
+        else:
+            action, _ = self.Q_Actor.sample(normalize_state)
+        return action.cpu().numpy().astype(np.float32)
 
+    @torch.no_grad()
     def n_step_sliding_window(self):
         n_return = gamma_pow = 0
         first_state, first_action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
         for i in range(self.n_step_return):
             _, _, reward, next_state, terminated, truncated = self.n_step_buffer[i]
-            n_return += (self.gamma ** gamma_pow) * reward
+            if i > 0:
+                n_return += (self.gamma ** gamma_pow) * (reward - self.alpha_explore * log_prob)
+            else:
+                n_return += reward
             gamma_pow += 1
 
             if truncated or terminated:
                 break
+
+            if i < self.n_step_return - 1:
+                _, log_prob = self.Q_Actor.sample(torch.as_tensor(next_state, dtype=torch.float32))
 
         self.replay_buffer.append([first_state, first_action, n_return, next_state, terminated, gamma_pow])
         self.n_step_buffer.popleft()
@@ -252,7 +285,7 @@ class TD3:
 
     @torch.no_grad()
     def update_t_nets(self):
-        for online_net, target_net in ((self.Q_Actor, self.T_Actor), (self.Q1_Critic, self.T1_Critic), 
+        for online_net, target_net in ((self.Q1_Critic, self.T1_Critic), 
                                       (self.Q2_Critic, self.T2_Critic)):
             for online_param, target_param in zip(online_net.parameters(), target_net.parameters()):
                 target_param.mul_(1 - self.tau_update_t_nets)
@@ -262,19 +295,12 @@ class TD3:
     def compute_target(self, next_state, n_step_return, terminated, gamma_pow):
         # normalize_next_state = self.preprocess(next_state)
         normalize_next_state = next_state
-        next_action = self.T_Actor(normalize_next_state)
-
-        noise = torch.randn_like(next_action) * self.target_policy_noise
-        noise = torch.clamp(noise, -self.target_noise_clip, self.target_noise_clip)
-        
-        action_low = torch.as_tensor(self.env.action_space.low, dtype=torch.float32, device=self.device)
-        action_high = torch.as_tensor(self.env.action_space.high, dtype=torch.float32, device=self.device)
-        next_action_clip = torch.clamp(next_action + noise, action_low, action_high)
-            
-        next_q1_value = self.T1_Critic(normalize_next_state, next_action_clip)
-        next_q2_value = self.T2_Critic(normalize_next_state, next_action_clip)
+        next_action, next_log_prob = self.Q_Actor.sample(normalize_next_state)
+                    
+        next_q1_value = self.T1_Critic(normalize_next_state, next_action)
+        next_q2_value = self.T2_Critic(normalize_next_state, next_action)
         target = torch.where(terminated, n_step_return, n_step_return + (self.gamma ** gamma_pow) * 
-                             torch.minimum(next_q1_value, next_q2_value))
+                             (torch.minimum(next_q1_value, next_q2_value) - self.alpha_explore * next_log_prob))
         return target
 
     def update_q_critic(self, indx, state, action, reward, next_state, terminated, gamma_pow, probailities):
@@ -311,18 +337,22 @@ class TD3:
     def update_q_actor(self, state):
         state = state.to(self.device)
         self.Q1_Critic.requires_grad_(False)
+        self.Q2_Critic.requires_grad_(False)
 
         # normalize_state = self.preprocess(state)
         normalize_state = state
-        policy_action = self.Q_Actor(normalize_state)
+        policy_action, policy_log_prob = self.Q_Actor.sample(normalize_state)
         policy_q1_value = self.Q1_Critic(normalize_state, policy_action)
-        actor_loss = -policy_q1_value.mean()
+        policy_q2_value = self.Q2_Critic(normalize_state, policy_action)
+
+        actor_loss = -(torch.minimum(policy_q1_value, policy_q2_value) - self.alpha_explore * policy_log_prob).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
         self.Q1_Critic.requires_grad_(True)
+        self.Q2_Critic.requires_grad_(True)
         return actor_loss.item()
         
     def fit(self):
