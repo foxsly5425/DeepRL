@@ -182,7 +182,8 @@ class SAC:
     def __init__(self, env, episodes=10000, batch_size=256, device='cpu', 
                 gamma=0.99, lr=3*1e-4, buffer_size_for_start_train=2000, 
                 max_size_buffer=40000, alpha_buffer=0.5, epsilon_buffer=1e-4, beta_per_weight=0.5, beta_per_weight_decay=1.05,
-                n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, alpha_explore=0.2):
+                n_step_return=1, tau_update_t_nets=0.005, policy_delay=2, alpha_explore=0.2,
+                log_every=1e-5):
         
         self.n_step_return = n_step_return 
         self.n_step_buffer = deque()
@@ -230,7 +231,8 @@ class SAC:
         self.batch_size = batch_size
         self.update_steps = 0
         self.env_steps = 0
-
+        self.log_every = log_every 
+        
         self.obs_count = 0
         self.obs_mean = np.zeros(self.state_dim, dtype=np.float64)
         self.obs_m2 = np.zeros(self.state_dim, dtype=np.float64)
@@ -533,8 +535,8 @@ class SAC:
         
     def fit(self):
         metric_time = 0
-        log_every = 10000
-        next_log_steps = (self.env_steps // log_every + 1) * log_every
+        log_step = log_episode = log_critic_step = log_actor_step = 0
+        next_log_steps = (self.env_steps // self.log_every + 1) * self.log_every
 
         for episode in range(1, self.episodes+1):
             start_time = time.time()
@@ -552,6 +554,7 @@ class SAC:
                 episod_return += total_reward
                 episode_steps += 1
                 self.env_steps += 1
+                log_step += 1
 
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
                     # batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, \
@@ -562,12 +565,15 @@ class SAC:
                     critic_loss = self.update_q_critic(*batch)
                     self.history['critic_loss'].append(critic_loss)
                     self.update_steps += 1
+                    log_critic_step += 1
 
                     if self.update_steps % self.policy_delay == 0:
                         actor_loss = self.update_q_actor(batch_state)
                         self.update_t_nets()
                         self.history['actor_loss'].append(actor_loss)
-
+                        log_actor_step += 1
+            log_episode += 1
+            
             self.history['return'].append(episod_return)
 
             max_steps = self.env.spec.max_episode_steps
@@ -579,13 +585,14 @@ class SAC:
             end_time = time.time()
             metric_time += end_time - start_time
             
-            if self.env_steps >= next_log_steps:
+            if log_step >= self.log_every:
                 while self.env_steps >= next_log_steps:
                     self.beta_per_weight = min(1, self.beta_per_weight * self.beta_per_weight_decay)
-                    next_log_steps += log_every
+                    next_log_steps += self.log_every
+                self.evaluate_policy()
+                self.metrics(episode, metric_time, log_step, log_episode, log_critic_step, log_actor_step)
+                log_step = log_episode = log_critic_step = log_actor_step = 0
 
-                self.eval_policy()
-                self.metrics(episode, metric_time)
 
     @torch.no_grad()
     def evaluate_for_visualization(self, seed=42):  
@@ -660,20 +667,20 @@ class SAC:
         self.history['eval_summary'].append(record)
         return record
 
-    def metrics(self, episode, metric_time):
-        recent_success = self.history['episode_success'][-100:]
+    def metrics(self, episode, metric_time, log_step, log_episode, log_critic_step, log_actor_step):
+        recent_success = self.history['episode_success'][-log_episode:]
         success_rate = np.mean(recent_success)
         self.history['success_rate'].append(success_rate)
-        recent_length = self.history['episode_length'][-100:]
-        recent_return = self.history['return'][-100:]
+        recent_length = self.history['episode_length'][-log_episode:]
+        recent_return = self.history['return'][-log_episode:]
         print(f'episod: {episode}, env steps: {self.env_steps}') 
-        print(f'success rate (last 100 episodes): {success_rate:.1%}')
-        print(f'mean_episode_length (last 100 episodes): {np.mean(recent_length)}')
-        print(f'mean return (last 100 episodes): {np.mean(recent_return)}')
+        print(f'success rate (last {log_episode} episodes): {success_rate:.1%}')
+        print(f'mean_episode_length (last {log_episode} episodes): {np.mean(recent_length)}')
+        print(f'mean return (last {log_episode} episodes): {np.mean(recent_return)}')
         if self.history['td_abs']:
-            print(f"td_abs (last 1000 critic updates): {np.mean(self.history['td_abs'][-1000:]):.4f}")
+            print(f"td_abs (last {log_critic_step} critic updates): {np.mean(self.history['td_abs'][-log_critic_step:]):.4f}")
         if self.history['entropy']:
-            print(f"entropy (last 1000 actor updates): {np.mean(self.history['entropy'][-1000:]):.4f}")
+            print(f"entropy (last {log_actor_step} actor updates): {np.mean(self.history['entropy'][-log_actor_step:]):.4f}")
         if self.history["eval_summary"]:
             result = self.history["eval_summary"][-1]
             print(
