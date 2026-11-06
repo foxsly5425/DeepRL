@@ -229,13 +229,15 @@ class SAC:
         self.episodes = episodes
         self.batch_size = batch_size
         self.update_steps = 0
+        self.env_steps = 0
 
         self.obs_count = 0
         self.obs_mean = np.zeros(self.state_dim, dtype=np.float64)
         self.obs_m2 = np.zeros(self.state_dim, dtype=np.float64)
 
-        self.history = {'return': [], 'critic_loss': [], 'actor_loss': [], 'success_rate': [],
-                        'episode_success': [], 'episode_length': [], 'eval': dict()}
+        self.history = {'return': [], 'critic_loss': [], 'actor_loss': [], 'success_rate': [], 
+                        'episode_success': [], 'episode_length': [], 'td_abs': [], 'entropy': [], 
+                        'eval_visual': dict(), 'eval_summary': []}
 
     def update_obs_metrics(self, observation):
         x = np.asarray(observation, dtype=np.float64)
@@ -484,6 +486,10 @@ class SAC:
         buffer_prior = torch.maximum(torch.abs(effective_delta_1), 
                                      torch.abs(effective_delta_2)).detach().cpu().numpy()
 
+        with torch.no_grad():
+            td_abs = ((masked_delta_1.abs() + masked_delta_2.abs()).sum(dim=1) / (2 * num_valid)).mean()
+            self.history['td_abs'].append(td_abs.item())
+
         critic_raw_loss = delta_1.square() + delta_2.square()
         
         weight = ((len(self.replay_buffer) * probailities) ** (-self.beta_per_weight)).to(self.device)
@@ -509,6 +515,9 @@ class SAC:
         # normalize_state = self.preprocess(state)
         normalize_state = state
         _, policy_action, policy_log_prob = self.Q_Actor.sample(normalize_state)
+
+        self.history['entropy'].append(-policy_log_prob.detach().mean().item())
+
         policy_q1_value = self.Q1_Critic(normalize_state, policy_action)
         policy_q2_value = self.Q2_Critic(normalize_state, policy_action)
 
@@ -523,10 +532,10 @@ class SAC:
         return actor_loss.item()
         
     def fit(self):
-        max_position_lst = []
-        min_position_lst = []
         metric_time = 0
-        
+        log_every = 10000
+        next_log_steps = (self.env_steps // log_every + 1) * log_every
+
         for episode in range(1, self.episodes+1):
             start_time = time.time()
             
@@ -534,7 +543,6 @@ class SAC:
             self.update_obs_metrics(observation)
             state = torch.tensor(observation, dtype=torch.float32)
             terminated = truncated = False  
-            max_position = min_position = observation[0]
 
             episod_return = 0
             episode_steps = 0
@@ -543,7 +551,8 @@ class SAC:
                 state = next_state
                 episod_return += total_reward
                 episode_steps += 1
-        
+                self.env_steps += 1
+
                 if len(self.replay_buffer) >= max(self.batch_size, self.buffer_size_for_start_train):
                     # batch_indx, batch_state, batch_action, batch_reward, batch_next_state, batch_terminated, \
                     #                          batch_gamma_pow, batch_intermediate_state, batch_probabilities, \
@@ -566,52 +575,110 @@ class SAC:
             self.history['episode_success'].append(bool(success))
             self.history['episode_length'].append(episode_steps)
 
-            if episode % 100 == 0:
-                self.beta_per_weight = min(1, self.beta_per_weight * self.beta_per_weight_decay)
-
                 
             end_time = time.time()
             metric_time += end_time - start_time
             
-            if episode % 100  == 0:
+            if self.env_steps >= next_log_steps:
+                while self.env_steps >= next_log_steps:
+                    self.beta_per_weight = min(1, self.beta_per_weight * self.beta_per_weight_decay)
+                    next_log_steps += log_every
+
+                self.eval_policy()
                 self.metrics(episode, metric_time)
 
     @torch.no_grad()
-    def eval(self, seed=42):    
-        observation, _ = self.env.reset(seed=seed)
-        truncated = terminated = False
+    def evaluate_for_visualization(self, seed=42):  
 
-        key = len(self.history['return'])
-        record = {'actions': [], 'seed': seed, 'return': 0, 'length': 0}
+        eval_env = gym.make(self.env.spec.id, 
+                            self.env.spec.max_episode_steps)
+
+        was_training = self.Q_Actor.training
+        self.Q_Actor.eval()
+
+        try:
+            observation, _ = eval_env.reset(seed=seed)
+            truncated = terminated = False
+
+            key = len(self.history['return'])
+            record = {'actions': [], 'seed': seed, 'return': 0, 'length': 0}
         
-        record['actions'] = []
-        record['seed'] = seed
-        episode_reward = episode_length = 0
+            record['actions'] = []
+            record['seed'] = seed
+            episode_reward = episode_length = 0
         
-        while not (truncated or terminated):
-            state = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
-            normalize_state = self.preprocess(state)
-            
-            action = self.select_action(state, deterministic=True)
-            observation, reward, terminated, truncated, _ = self.env.step(action)
-                        
-            episode_reward += reward
-            episode_length += 1
-            
-            record['actions'].append(action)
+            while not (truncated or terminated):
+                state = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
+                # normalize_state = self.preprocess(state)
+                
+                action, _, _ = self.select_action(state, deterministic=True)
+                observation, reward, terminated, truncated, _ = eval_env.step(action)
+                            
+                episode_reward += reward
+                episode_length += 1
+                
+                record['actions'].append(action)
+        finally:
+            self.Q_Actor.train(was_training)
+            eval_env.close()
             
         record['return'] = episode_reward 
         record['length'] = episode_length
-        self.history['eval'][key] = record
+        self.history['eval_visual'][key] = record
+
+    @torch.no_grad()
+    def evaluate_policy(self, seeds=(42, 43, 44, 45, 46)):
+        eval_env = gym.make(
+            self.env.spec.id,
+            max_episode_steps=self.env.spec.max_episode_steps,
+        )
+        returns = []
+        was_training = self.Q_Actor.training
+        self.Q_Actor.eval()
+        try:
+            for seed in seeds:
+                observation, _ = eval_env.reset(seed=seed)
+                terminated = truncated = False
+                episode_return = 0.0
+                while not (terminated or truncated):
+                    state = torch.as_tensor(observation, dtype=torch.float32)
+                    action, _, _ = self.select_action(state, deterministic=True)
+                    observation, reward, terminated, truncated, _ = eval_env.step(action)
+                    episode_return += reward
+                returns.append(episode_return)
+        finally:
+            self.Q_Actor.train(was_training)
+            eval_env.close()
+
+        record = {
+            'env_steps': self.env_steps,
+            'seeds': list(seeds),
+            'returns': returns,
+            'return_mean': float(np.mean(returns)),
+            'return_std': float(np.std(returns)),
+        }
+        self.history['eval_summary'].append(record)
+        return record
 
     def metrics(self, episode, metric_time):
         recent_success = self.history['episode_success'][-100:]
-        success_rate = 100 * np.mean(recent_success)
+        success_rate = np.mean(recent_success)
         self.history['success_rate'].append(success_rate)
         recent_length = self.history['episode_length'][-100:]
         recent_return = self.history['return'][-100:]
-        print(f'episod: {episode}, success rate: {success_rate}%')
-        print(f'mean_episode_length: {np.mean(recent_length)}')
-        print(f'mean return: {np.mean(recent_return)}')
+        print(f'episod: {episode}, env steps: {self.env_steps}') 
+        print(f'success rate (last 100 episodes): {success_rate:.1%}')
+        print(f'mean_episode_length (last 100 episodes): {np.mean(recent_length)}')
+        print(f'mean return (last 100 episodes): {np.mean(recent_return)}')
+        if self.history['td_abs']:
+            print(f"td_abs (last 1000 critic updates): {np.mean(self.history['td_abs'][-1000:]):.4f}")
+        if self.history['entropy']:
+            print(f"entropy (last 1000 actor updates): {np.mean(self.history['entropy'][-1000:]):.4f}")
+        if self.history["eval_summary"]:
+            result = self.history["eval_summary"][-1]
+            print(
+                f"eval return: {result['return_mean']:.1f} "
+                f"+/- {result['return_std']:.1f}"
+            )
         print(f'time: {metric_time // 60} min')
         print('-'*50)
